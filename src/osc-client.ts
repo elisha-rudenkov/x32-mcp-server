@@ -1,5 +1,40 @@
 import OSC from "osc-js";
 
+/**
+ * Coerce a JS value to the correct JS type for osc-js's inference.
+ * osc-js picks OSC type tag from JS type: integer number -> 'i', decimal -> 'f', string -> 's', bool -> 'T'/'F'.
+ * If `osctype` is given, we force the conversion; otherwise we parse-through:
+ *  - string "6" + osctype "int" => 6
+ *  - string "0.5" + osctype "float" => 0.5
+ *  - number 6 with no osctype => 6 (int)
+ *  - number 0.5 with no osctype => 0.5 (float)
+ *
+ * Critical for X32: `/config/color`, `/config/icon`, `/config/chlink`, scene recall, etc. all require int type.
+ * LLMs often pass ints as JSON strings when schemas are loose — this lets callers force the right tag.
+ */
+export function coerceOscArg(v: any, osctype?: "int" | "float" | "string" | "bool"): any {
+    if (osctype === "int") {
+        const n = typeof v === "number" ? Math.trunc(v) : parseInt(String(v), 10);
+        if (Number.isNaN(n)) throw new Error(`Cannot coerce ${JSON.stringify(v)} to int`);
+        // ensure integer for osc-js isInt() check (n % 1 === 0)
+        return n;
+    }
+    if (osctype === "float") {
+        const n = typeof v === "number" ? v : parseFloat(String(v));
+        if (Number.isNaN(n)) throw new Error(`Cannot coerce ${JSON.stringify(v)} to float`);
+        // osc-js isFloat requires n % 1 !== 0; force a fractional component if whole
+        return Number.isInteger(n) ? n + 0.0000001 : n;
+    }
+    if (osctype === "string") return String(v);
+    if (osctype === "bool") {
+        if (typeof v === "boolean") return v;
+        const s = String(v).toLowerCase();
+        return s === "true" || s === "1" || s === "on";
+    }
+    // No explicit type — pass through; osc-js will infer from JS type.
+    return v;
+}
+
 // ========== Routing source encoders/decoders ==========
 // Confirmed against live X32 (firmware 2.07+) on 2026-04-14.
 // Probe data: slot 27 source 129 => X32-Edit label "Card 01" => 129-160 = Card 1-32.
@@ -239,6 +274,58 @@ export class OSCClient {
     async setChannelColor(channel: number, color: number): Promise<void> {
         const path = `${this.getChannelPath(channel)}/config/color`;
         this.sendCommand(path, [color]);
+    }
+
+    async getChannelColor(channel: number): Promise<number> {
+        const path = `${this.getChannelPath(channel)}/config/color`;
+        return await this.sendAndReceive(path);
+    }
+
+    async setChannelIcon(channel: number, icon: number): Promise<void> {
+        const path = `${this.getChannelPath(channel)}/config/icon`;
+        this.sendCommand(path, [icon]);
+    }
+
+    async getChannelIcon(channel: number): Promise<number> {
+        const path = `${this.getChannelPath(channel)}/config/icon`;
+        return await this.sendAndReceive(path);
+    }
+
+    // Channel linking is per-pair. Addresses: /config/chlink/1-2, 3-4, ... 31-32.
+    // Each returns int 0 (unlinked) or 1 (linked).
+    async getChannelLinks(): Promise<Array<{ pair: string; linked: boolean }>> {
+        const result: Array<{ pair: string; linked: boolean }> = [];
+        for (let i = 1; i <= 31; i += 2) {
+            const pair = `${i}-${i + 1}`;
+            const v = await this.safeRead(`/config/chlink/${pair}`);
+            result.push({ pair, linked: v === 1 });
+        }
+        return result;
+    }
+
+    async setChannelLink(pair: string, linked: boolean): Promise<void> {
+        this.sendCommand(`/config/chlink/${pair}`, [linked ? 1 : 0]);
+    }
+
+    async getBusLinks(): Promise<Array<{ pair: string; linked: boolean }>> {
+        const result: Array<{ pair: string; linked: boolean }> = [];
+        for (let i = 1; i <= 15; i += 2) {
+            const pair = `${i}-${i + 1}`;
+            const v = await this.safeRead(`/config/buslink/${pair}`);
+            result.push({ pair, linked: v === 1 });
+        }
+        return result;
+    }
+
+    async setBusLink(pair: string, linked: boolean): Promise<void> {
+        this.sendCommand(`/config/buslink/${pair}`, [linked ? 1 : 0]);
+    }
+
+    // Read a block-level input routing assignment (8-ch group).
+    async getRoutingBlockIn(block: string): Promise<{ raw: number; label: string } | null> {
+        const raw = await this.safeRead(`/config/routing/IN/${block}`);
+        if (raw === null) return null;
+        return { raw, label: decodeBlockInSource(raw) };
     }
 
     // ========== EQ Controls ==========
@@ -926,6 +1013,32 @@ export class OSCClient {
     // User-defined routing (firmware 4.0+): per-slot patches for the "User In"
     // and "User Out" blocks. When a routing block is set to source type
     // "USER IN" / "USER OUT", these tables determine the actual per-channel source.
+    /**
+     * Single-call summary of ALL routing layers, decoded. Returns:
+     *  - inputBlocks: 4 block assignments (which source group feeds each 8-ch range)
+     *  - outputBlocks, aes50a, aes50b, card: same structure for other directions
+     *  - userIn: 32 per-slot patches (firmware 4.0+ 1:1 routing)
+     *  - userOut: 48 per-slot patches
+     *
+     * Use this FIRST when planning routing changes — it shows the full topology so you can tell
+     * whether a channel is patched via block routing (legacy 8-ch groups) or per-slot User In (firmware 4.0+).
+     * If an input block shows "User In 25-32", per-channel patches live in userIn[24..31].
+     */
+    async getRoutingOverview(): Promise<any> {
+        const routing = await this.getRouting();
+        const userRouting = await this.getUserRouting();
+        return {
+            summary: "X32 routing topology. Input blocks select which 8-ch source group feeds each channel range. When a block is set to 'User In N-M', the userIn per-slot table determines the actual physical source for each channel in that range.",
+            inputBlocks: routing.inputs,
+            outputBlocks: routing.outputs,
+            aes50a: routing.aes50a,
+            aes50b: routing.aes50b,
+            card: routing.card,
+            userIn: userRouting.userIn,
+            userOut: userRouting.userOut,
+        };
+    }
+
     async getUserRouting(): Promise<any> {
         const userRouting: any = { userIn: [], userOut: [] };
 
@@ -1030,13 +1143,42 @@ export class OSCClient {
 
     // ========== Custom Commands ==========
 
-    async sendCustomCommand(address: string, value?: any): Promise<void> {
+    /**
+     * Send a raw OSC command. Supports two modes:
+     *  - Write:  pass `value` (and optionally `osctype` = 'int'|'float'|'string'|'bool').
+     *            If `osctype` is omitted, type is inferred from the JS value
+     *            (integer numbers → int, decimals → float, strings → string, booleans → T/F).
+     *            Pass an array of { type, value } to send multiple typed args.
+     *  - Read:   omit `value` entirely — sends a query and returns the mixer's reply value (or null on timeout).
+     *
+     * X32 is strict about OSC type tags: `/config/color` requires int (',i') — sending string '6' is silently dropped.
+     * Use `osctype: 'int'` when LLMs may pass values as strings.
+     */
+    async sendCustomCommand(
+        address: string,
+        value?: any,
+        osctype?: "int" | "float" | "string" | "bool",
+    ): Promise<any> {
+        // Read mode
         if (value === undefined) {
-            this.sendCommand(address);
-        } else {
-            // osc-js automatically handles type conversion
-            this.sendCommand(address, Array.isArray(value) ? value : [value]);
+            try {
+                return await this.sendAndReceive(address);
+            } catch {
+                return null;
+            }
         }
+
+        // Typed multi-arg: value is an array of { type, value } entries
+        if (Array.isArray(value) && value.length > 0 && typeof value[0] === "object" && value[0] !== null && "type" in value[0]) {
+            const packed = value.map((entry: any) => coerceOscArg(entry.value, entry.type));
+            this.sendCommand(address, packed);
+            return;
+        }
+
+        // Single value, optional explicit type
+        const args = Array.isArray(value) ? value : [value];
+        const packed = args.map((v: any) => coerceOscArg(v, osctype));
+        this.sendCommand(address, packed);
     }
 
     close(): void {

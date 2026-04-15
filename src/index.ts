@@ -157,7 +157,7 @@ const TOOLS: Tool[] = [
                 },
                 name: {
                     type: "string",
-                    description: "Channel name (max 6 characters)",
+                    description: "Channel name (X32 accepts up to 12 characters; longer names get silently truncated by the console)",
                 },
             },
             required: ["channel", "name"],
@@ -1140,7 +1140,7 @@ const TOOLS: Tool[] = [
     },
     {
         name: "osc_set_user_routing_in",
-        description: "Set a single User In routing slot's source (1-32). Source can be a label string like 'Card 1', 'Local 27', 'AES50A 5', 'AES50B 12', 'AUX In 3', 'OFF' — or the raw int (0=OFF, 1-32=Local 1-32, 33-80=AES50A 1-48, 81-128=AES50B 1-48, 129-160=Card 1-32, 161-168=AUX In 1-8).",
+        description: "Per-channel 1:1 input routing (firmware 4.0+). Each of the 32 channel slots can be independently assigned to ANY physical source (Local, AES50A/B, Card, AuxIn) — this replaces the old 8-channel block constraint and is the modern way to build scenes. Requires the corresponding input routing block (/config/routing/IN/N-M) to be set to 'User In' (block enum values 20-23) for the patch to take effect.\n\nSource accepts a label string: 'Card 1', 'Local 27', 'AES50A 5', 'AES50B 12', 'AUX In 3', 'OFF'. Or raw int: 0=OFF, 1-32=Local 1-32, 33-80=AES50A 1-48, 81-128=AES50B 1-48, 129-160=Card 1-32, 161-168=AUX In 1-8.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1149,6 +1149,46 @@ const TOOLS: Tool[] = [
             },
             required: ["slot", "source"],
         },
+    },
+    {
+        name: "osc_get_routing_overview",
+        description: "RECOMMENDED FIRST CALL for any routing work. Returns the full X32 routing topology in one shot: input/output/AES50/Card block assignments (which 8-ch source group feeds each range) PLUS the 32-slot User In table PLUS the 48-slot User Out table, all decoded to human labels. Shows whether each channel range uses legacy 8-ch block routing or firmware-4.0+ per-slot User In (1:1 patching). If inputBlocks shows 'User In 25-32', the per-channel sources for channels 25-32 live in userIn[24..31].",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_get_channel_color",
+        description: "Get channel strip color (0-15)",
+        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 } }, required: ["channel"] },
+    },
+    {
+        name: "osc_get_channel_icon",
+        description: "Get channel strip icon index",
+        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 } }, required: ["channel"] },
+    },
+    {
+        name: "osc_set_channel_icon",
+        description: "Set channel strip icon (int enum, 1-74 approximately; see X32 icon list)",
+        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 }, icon: { type: "number" } }, required: ["channel", "icon"] },
+    },
+    {
+        name: "osc_get_channel_links",
+        description: "Get stereo-link state for each channel pair (1-2, 3-4, ..., 31-32). Returns 16 per-pair booleans.",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_set_channel_link",
+        description: "Link or unlink a channel pair for stereo operation. Pair format: '1-2', '3-4', ..., '31-32'.",
+        inputSchema: { type: "object", properties: { pair: { type: "string" }, linked: { type: "boolean" } }, required: ["pair", "linked"] },
+    },
+    {
+        name: "osc_get_bus_links",
+        description: "Get stereo-link state for each bus pair (1-2, 3-4, ..., 15-16).",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_set_bus_link",
+        description: "Link or unlink a bus pair for stereo operation. Pair format: '1-2', '3-4', ..., '15-16'.",
+        inputSchema: { type: "object", properties: { pair: { type: "string" }, linked: { type: "boolean" } }, required: ["pair", "linked"] },
     },
     {
         name: "osc_list_routing_sources",
@@ -1237,7 +1277,7 @@ const TOOLS: Tool[] = [
     // ========== Routing ==========
     {
         name: "osc_set_channel_source",
-        description: "Set the input source for a channel",
+        description: "Set the channel-strip input tap (/ch/NN/config/source). Value selects a tap WITHIN whatever source group is currently feeding this channel's 8-ch routing block — NOT a direct physical input picker. Source map: 0=OFF, 1-32=Input N (routed via the active block), 33-40=AUX/USB in, 41-48=FX return L/R. \n\nIMPORTANT: For per-channel 1:1 physical input mapping (firmware 4.0+), this is usually NOT the right tool. Instead: (a) set the input routing block to 'User In' with osc_custom_command /config/routing/IN/N-M as int, and (b) use osc_set_user_routing_in to patch each of the 32 User In slots to any physical source (Local/AES50A/AES50B/Card/AuxIn). Call osc_get_routing_overview first to see the current topology.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1338,7 +1378,7 @@ const TOOLS: Tool[] = [
     // ========== Custom Commands ==========
     {
         name: "osc_custom_command",
-        description: "Send a custom OSC command to the mixer",
+        description: "Send a raw OSC command. TWO modes:\n  (1) WRITE: pass 'value'. Include 'osctype' ('int'|'float'|'string'|'bool') when the address requires a specific OSC type tag — X32 silently drops type mismatches (e.g., /ch/NN/config/color REQUIRES int; passing '6' as string fails silently). For multiple args, pass value as an array of {type, value} objects.\n  (2) READ: omit 'value' — the tool sends a query and returns the mixer's reply (or null on timeout). Use this to verify writes or to read addresses that have no dedicated getter.\n\nCommon X32 addresses that REQUIRE osctype='int': /ch/NN/config/color, /ch/NN/config/icon, /config/chlink, /config/buslink, /config/mute/N, /-stat/solosw/NN, scene recall indices.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1347,7 +1387,12 @@ const TOOLS: Tool[] = [
                     description: "OSC address (e.g., /ch/01/mix/fader)",
                 },
                 value: {
-                    description: "Value to send (number, string, or array)",
+                    description: "Value to send. Omit to READ the address and get the mixer's reply. Can be a scalar (number/string/bool) or an array of {type, value} objects for multi-arg messages.",
+                },
+                osctype: {
+                    type: "string",
+                    enum: ["int", "float", "string", "bool"],
+                    description: "Force the OSC type tag for 'value'. Use 'int' for color/icon/chlink/mute-group/solosw/scene addresses. When omitted, type is inferred from JSON type.",
                 },
             },
             required: ["address"],
@@ -2161,6 +2206,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 };
             }
 
+            case "osc_get_routing_overview": {
+                const ov = await osc.getRoutingOverview();
+                return { content: [{ type: "text", text: `Routing overview:\n${JSON.stringify(ov, null, 2)}` }] };
+            }
+
+            case "osc_get_channel_color": {
+                const { channel } = args as { channel: number };
+                const c = await osc.getChannelColor(channel);
+                return { content: [{ type: "text", text: `Channel ${channel} color: ${c}` }] };
+            }
+
+            case "osc_get_channel_icon": {
+                const { channel } = args as { channel: number };
+                const i = await osc.getChannelIcon(channel);
+                return { content: [{ type: "text", text: `Channel ${channel} icon: ${i}` }] };
+            }
+
+            case "osc_set_channel_icon": {
+                const { channel, icon } = args as { channel: number; icon: number };
+                await osc.setChannelIcon(channel, icon);
+                return { content: [{ type: "text", text: `Set channel ${channel} icon to ${icon}` }] };
+            }
+
+            case "osc_get_channel_links": {
+                const links = await osc.getChannelLinks();
+                return { content: [{ type: "text", text: `Channel links:\n${JSON.stringify(links, null, 2)}` }] };
+            }
+
+            case "osc_set_channel_link": {
+                const { pair, linked } = args as { pair: string; linked: boolean };
+                await osc.setChannelLink(pair, linked);
+                return { content: [{ type: "text", text: `Channel pair ${pair} ${linked ? "linked" : "unlinked"}` }] };
+            }
+
+            case "osc_get_bus_links": {
+                const links = await osc.getBusLinks();
+                return { content: [{ type: "text", text: `Bus links:\n${JSON.stringify(links, null, 2)}` }] };
+            }
+
+            case "osc_set_bus_link": {
+                const { pair, linked } = args as { pair: string; linked: boolean };
+                await osc.setBusLink(pair, linked);
+                return { content: [{ type: "text", text: `Bus pair ${pair} ${linked ? "linked" : "unlinked"}` }] };
+            }
+
             case "osc_list_routing_sources": {
                 const userIn: Record<string, number> = { OFF: 0 };
                 for (let i = 1; i <= 32; i++) userIn[`Local ${i}`] = i;
@@ -2322,18 +2412,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             // ========== Custom Commands ==========
             case "osc_custom_command": {
-                const { address, value } = args as {
+                const { address, value, osctype } = args as {
                     address: string;
                     value?: any;
+                    osctype?: "int" | "float" | "string" | "bool";
                 };
-                await osc.sendCustomCommand(address, value);
+                const result = await osc.sendCustomCommand(address, value, osctype);
+                if (value === undefined) {
+                    return {
+                        content: [{ type: "text", text: `READ ${address} => ${JSON.stringify(result)}` }],
+                    };
+                }
                 return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Sent OSC command to ${address}${value !== undefined ? ` with value ${JSON.stringify(value)}` : ""}`,
-                        },
-                    ],
+                    content: [{ type: "text", text: `WROTE ${address} = ${JSON.stringify(value)}${osctype ? ` (forced ${osctype})` : ""}` }],
                 };
             }
 
