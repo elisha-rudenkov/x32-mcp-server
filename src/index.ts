@@ -231,6 +231,110 @@ const TOOLS: Tool[] = [
         },
     },
     {
+        name: "osc_get_eq_frequency",
+        description: "Get EQ frequency for a channel band (returns raw 0-1 value)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+                band: {
+                    type: "number",
+                    description: "EQ band (1-4)",
+                    minimum: 1,
+                    maximum: 4,
+                },
+            },
+            required: ["channel", "band"],
+        },
+    },
+    {
+        name: "osc_get_eq_q",
+        description: "Get EQ Q factor for a channel band (returns raw 0-1 value)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+                band: {
+                    type: "number",
+                    description: "EQ band (1-4)",
+                    minimum: 1,
+                    maximum: 4,
+                },
+            },
+            required: ["channel", "band"],
+        },
+    },
+    {
+        name: "osc_get_eq_type",
+        description: "Get EQ type for a channel band (returns raw value: 0=LCut, 1=LShv, 2=PEQ, 3=VEQ, 4=HShv, 5=HCut)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+                band: {
+                    type: "number",
+                    description: "EQ band (1-4)",
+                    minimum: 1,
+                    maximum: 4,
+                },
+            },
+            required: ["channel", "band"],
+        },
+    },
+    {
+        name: "osc_get_eq_on",
+        description: "Get whether EQ is enabled for a channel",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+            },
+            required: ["channel"],
+        },
+    },
+    {
+        name: "osc_copy_eq",
+        description: "Copy all EQ settings (gain, frequency, Q, type, on/off) from one channel to another",
+        inputSchema: {
+            type: "object",
+            properties: {
+                source_channel: {
+                    type: "number",
+                    description: "Source channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+                target_channel: {
+                    type: "number",
+                    description: "Target channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+            },
+            required: ["source_channel", "target_channel"],
+        },
+    },
+    {
         name: "osc_set_eq_frequency",
         description: "Set EQ frequency for a channel band",
         inputSchema: {
@@ -818,8 +922,273 @@ const TOOLS: Tool[] = [
     },
     // ========== Effects ==========
     {
+        name: "osc_get_effect_type",
+        description: "Get the effect type/algorithm loaded in an FX slot",
+        inputSchema: {
+            type: "object",
+            properties: {
+                effect: {
+                    type: "number",
+                    description: "Effect number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["effect"],
+        },
+    },
+    {
+        name: "osc_get_effect_on",
+        description: "Get whether an FX return channel is unmuted (X32 FX slots are always instantiated; this checks the FX return mute state)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                effect: {
+                    type: "number",
+                    description: "Effect number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["effect"],
+        },
+    },
+    {
+        name: "osc_get_effect_param",
+        description: "Get a parameter value for an effect",
+        inputSchema: {
+            type: "object",
+            properties: {
+                effect: {
+                    type: "number",
+                    description: "Effect number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+                param: {
+                    type: "number",
+                    description: "Parameter number (1-16)",
+                    minimum: 1,
+                    maximum: 16,
+                },
+            },
+            required: ["effect", "param"],
+        },
+    },
+    {
+        name: "osc_get_all_effects",
+        description: "Get a summary of all 8 FX slots including type and first 8 parameters",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_get_channel_strip",
+        description: "Get full channel strip: name, fader, mute, pan, headamp (gain/phantom), EQ (all 4 bands with gain/freq/Q/type), gate (full params), compressor (full params), and all 16 bus sends (level/pan/pre-post)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+            },
+            required: ["channel"],
+        },
+    },
+    {
+        name: "osc_get_bus_strip",
+        description: "Get full mix bus strip: name, fader, mute, pan, EQ, dynamics",
+        inputSchema: {
+            type: "object",
+            properties: {
+                bus: {
+                    type: "number",
+                    description: "Bus number (1-16)",
+                    minimum: 1,
+                    maximum: 16,
+                },
+            },
+            required: ["bus"],
+        },
+    },
+    {
+        name: "osc_get_aux_strip",
+        description: "Get aux input strip: name, fader, mute, pan, source",
+        inputSchema: {
+            type: "object",
+            properties: {
+                aux: {
+                    type: "number",
+                    description: "Aux input number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["aux"],
+        },
+    },
+    {
+        name: "osc_get_fxreturn_strip",
+        description: "Get FX return strip: name, fader, mute, pan",
+        inputSchema: {
+            type: "object",
+            properties: {
+                fxreturn: {
+                    type: "number",
+                    description: "FX return number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["fxreturn"],
+        },
+    },
+    {
+        name: "osc_get_matrix_strip",
+        description: "Get matrix output strip: name, fader, mute, pan, EQ",
+        inputSchema: {
+            type: "object",
+            properties: {
+                matrix: {
+                    type: "number",
+                    description: "Matrix number (1-6)",
+                    minimum: 1,
+                    maximum: 6,
+                },
+            },
+            required: ["matrix"],
+        },
+    },
+    {
+        name: "osc_get_dca",
+        description: "Get DCA group: name, fader, mute",
+        inputSchema: {
+            type: "object",
+            properties: {
+                dca: {
+                    type: "number",
+                    description: "DCA group number (1-8)",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["dca"],
+        },
+    },
+    {
+        name: "osc_get_main_strip",
+        description: "Get main stereo bus: fader, mute, pan, 6-band EQ, dynamics, plus mono bus status",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_get_headamp",
+        description: "Get headamp/preamp settings: gain and phantom power for a given headamp index (0-63 for local, 64-127 for AES50-A, 128-191 for AES50-B)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                index: {
+                    type: "number",
+                    description: "Headamp index (0-191)",
+                    minimum: 0,
+                    maximum: 191,
+                },
+            },
+            required: ["index"],
+        },
+    },
+    {
+        name: "osc_get_console_overview",
+        description: "Get a high-level overview of the ENTIRE console: all 32 channels (name/fader/mute), 16 buses, 8 DCAs, 6 matrices, 8 aux inputs, 8 FX returns, 8 FX slot types, and main bus. Warning: this reads ~200 parameters so takes several seconds.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_get_routing",
+        description: "Get full console routing: FX source assignments (which bus feeds which FX), input routing blocks, output routing blocks, AES50 routing, and card routing",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_get_user_routing",
+        description: "Get the user-defined routing tables (firmware 4.0+): 32 User In slot assignments and 48 User Out slot assignments. These determine the per-channel source when a routing block is set to USER IN/OUT.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_get_user_routing_in",
+        description: "Get a single User In routing slot assignment (1-32)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: { type: "number", description: "User In slot (1-32)", minimum: 1, maximum: 32 },
+            },
+            required: ["slot"],
+        },
+    },
+    {
+        name: "osc_set_user_routing_in",
+        description: "Set a single User In routing slot's source (1-32). Source can be a label string like 'Card 1', 'Local 27', 'AES50A 5', 'AES50B 12', 'AUX In 3', 'OFF' — or the raw int (0=OFF, 1-32=Local 1-32, 33-80=AES50A 1-48, 81-128=AES50B 1-48, 129-160=Card 1-32, 161-168=AUX In 1-8).",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: { type: "number", description: "User In slot (1-32)", minimum: 1, maximum: 32 },
+                source: { type: ["number", "string"], description: "Source label (e.g. 'Card 1') or raw int (0-168)" },
+            },
+            required: ["slot", "source"],
+        },
+    },
+    {
+        name: "osc_list_routing_sources",
+        description: "Reference dump: lists every valid User In source label and its numeric code, plus the block-level routing enum. Use this when you need to know what values to pass to set_user_routing_in or to interpret raw codes from get_routing.",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_get_user_routing_out",
+        description: "Get a single User Out routing slot assignment (1-48)",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: { type: "number", description: "User Out slot (1-48)", minimum: 1, maximum: 48 },
+            },
+            required: ["slot"],
+        },
+    },
+    {
+        name: "osc_set_user_routing_out",
+        description: "Set a single User Out routing slot's source (1-48). Source value is an integer representing the signal source per X32 OSC spec.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: { type: "number", description: "User Out slot (1-48)", minimum: 1, maximum: 48 },
+                source: { type: "number", description: "Source index (see X32 OSC spec for values)", minimum: 0 },
+            },
+            required: ["slot", "source"],
+        },
+    },
+    {
+        name: "osc_get_full_fx_chain",
+        description: "Get the complete FX signal chain: for each of the 8 FX slots, returns the FX type, all 16 parameters, source assignment (which bus feeds it), and the FX return channel state (fader/mute/name). This is the full picture of what effects are loaded, how they're configured, what feeds them, and whether the return is active.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
         name: "osc_set_effect_on",
-        description: "Enable or disable an effect",
+        description: "Mute/unmute an FX return channel (X32 FX are always instantiated; this controls the FX return mute)",
         inputSchema: {
             type: "object",
             properties: {
@@ -835,28 +1204,6 @@ const TOOLS: Tool[] = [
                 },
             },
             required: ["effect", "on"],
-        },
-    },
-    {
-        name: "osc_set_effect_mix",
-        description: "Set the mix level for an effect",
-        inputSchema: {
-            type: "object",
-            properties: {
-                effect: {
-                    type: "number",
-                    description: "Effect number (1-8)",
-                    minimum: 1,
-                    maximum: 8,
-                },
-                mix: {
-                    type: "number",
-                    description: "Mix level (0.0 to 1.0)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["effect", "mix"],
         },
     },
     {
@@ -1204,6 +1551,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             text: `Channel ${channel} EQ band ${band} is at ${gain > 0 ? "+" : ""}${gain.toFixed(1)}dB`,
                         },
                     ],
+                };
+            }
+
+            case "osc_get_eq_frequency": {
+                const { channel, band } = args as { channel: number; band: number };
+                const freq = await osc.getEQFrequency(channel, band);
+                return {
+                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} frequency: ${freq}` }],
+                };
+            }
+
+            case "osc_get_eq_q": {
+                const { channel, band } = args as { channel: number; band: number };
+                const qVal = await osc.getEQQ(channel, band);
+                return {
+                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} Q: ${qVal}` }],
+                };
+            }
+
+            case "osc_get_eq_type": {
+                const { channel, band } = args as { channel: number; band: number };
+                const eqType = await osc.getEQType(channel, band);
+                const typeNames = ["LCut", "LShv", "PEQ", "VEQ", "HShv", "HCut"];
+                return {
+                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} type: ${eqType} (${typeNames[eqType] || "unknown"})` }],
+                };
+            }
+
+            case "osc_get_eq_on": {
+                const { channel } = args as { channel: number };
+                const eqOn = await osc.getEQOn(channel);
+                return {
+                    content: [{ type: "text", text: `Channel ${channel} EQ is ${eqOn ? "enabled" : "disabled"}` }],
+                };
+            }
+
+            case "osc_copy_eq": {
+                const { source_channel, target_channel } = args as { source_channel: number; target_channel: number };
+                const results: string[] = [];
+
+                // Copy EQ on/off state
+                const eqOn = await osc.getEQOn(source_channel);
+                await osc.setEQOn(target_channel, eqOn);
+                results.push(`EQ enabled: ${eqOn}`);
+
+                // Copy all 4 bands
+                for (let band = 1; band <= 4; band++) {
+                    const gain = await osc.getEQ(source_channel, band);
+                    const freq = await osc.getEQFrequency(source_channel, band);
+                    const q = await osc.getEQQ(source_channel, band);
+                    const type = await osc.getEQType(source_channel, band);
+
+                    await osc.setEQ(target_channel, band, gain);
+                    await osc.setEQFrequency(target_channel, band, freq);
+                    await osc.setEQQ(target_channel, band, q);
+                    await osc.setEQType(target_channel, band, type);
+
+                    results.push(`Band ${band}: gain=${gain.toFixed(1)}dB, freq=${freq}, Q=${q}, type=${type}`);
+                }
+
+                return {
+                    content: [{ type: "text", text: `Copied EQ from channel ${source_channel} to channel ${target_channel}:\n${results.join("\n")}` }],
                 };
             }
 
@@ -1621,6 +2030,177 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             // ========== Effects ==========
+            case "osc_get_effect_type": {
+                const { effect } = args as { effect: number };
+                const fxType = await osc.getEffectType(effect);
+                return {
+                    content: [{ type: "text", text: `FX slot ${effect} type: ${fxType}` }],
+                };
+            }
+
+            case "osc_get_effect_on": {
+                const { effect } = args as { effect: number };
+                const fxOn = await osc.getEffectOn(effect);
+                return {
+                    content: [{ type: "text", text: `FX slot ${effect} is ${fxOn ? "enabled" : "disabled"}` }],
+                };
+            }
+
+            case "osc_get_effect_param": {
+                const { effect, param } = args as { effect: number; param: number };
+                const paramVal = await osc.getEffectParam(effect, param);
+                return {
+                    content: [{ type: "text", text: `FX slot ${effect} param ${param}: ${paramVal}` }],
+                };
+            }
+
+            case "osc_get_all_effects": {
+                const allFx = await osc.getAllEffects();
+                return {
+                    content: [{ type: "text", text: `All FX slots:\n${JSON.stringify(allFx, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_channel_strip": {
+                const { channel } = args as { channel: number };
+                const strip = await osc.getChannelStrip(channel);
+                return {
+                    content: [{ type: "text", text: `Channel ${channel} full strip:\n${JSON.stringify(strip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_bus_strip": {
+                const { bus } = args as { bus: number };
+                const busStrip = await osc.getBusStrip(bus);
+                return {
+                    content: [{ type: "text", text: `Bus ${bus} strip:\n${JSON.stringify(busStrip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_aux_strip": {
+                const { aux } = args as { aux: number };
+                const auxStrip = await osc.getAuxStrip(aux);
+                return {
+                    content: [{ type: "text", text: `Aux ${aux} strip:\n${JSON.stringify(auxStrip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_fxreturn_strip": {
+                const { fxreturn } = args as { fxreturn: number };
+                const fxrStrip = await osc.getFxReturnStrip(fxreturn);
+                return {
+                    content: [{ type: "text", text: `FX Return ${fxreturn} strip:\n${JSON.stringify(fxrStrip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_matrix_strip": {
+                const { matrix } = args as { matrix: number };
+                const mtxStrip = await osc.getMatrixStrip(matrix);
+                return {
+                    content: [{ type: "text", text: `Matrix ${matrix} strip:\n${JSON.stringify(mtxStrip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_dca": {
+                const { dca } = args as { dca: number };
+                const dcaData = await osc.getDCA(dca);
+                return {
+                    content: [{ type: "text", text: `DCA ${dca}:\n${JSON.stringify(dcaData, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_main_strip": {
+                const mainStrip = await osc.getMainStrip();
+                return {
+                    content: [{ type: "text", text: `Main bus:\n${JSON.stringify(mainStrip, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_headamp": {
+                const { index } = args as { index: number };
+                const ha = await osc.getHeadamp(index);
+                return {
+                    content: [{ type: "text", text: `Headamp ${index}:\n${JSON.stringify(ha, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_console_overview": {
+                const overview = await osc.getConsoleOverview();
+                return {
+                    content: [{ type: "text", text: `Console overview:\n${JSON.stringify(overview, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_routing": {
+                const routing = await osc.getRouting();
+                return {
+                    content: [{ type: "text", text: `Console routing:\n${JSON.stringify(routing, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_user_routing": {
+                const userRouting = await osc.getUserRouting();
+                return {
+                    content: [{ type: "text", text: `User-defined routing:\n${JSON.stringify(userRouting, null, 2)}` }],
+                };
+            }
+
+            case "osc_get_user_routing_in": {
+                const { slot } = args as { slot: number };
+                const src = await osc.getUserRoutingIn(slot);
+                return {
+                    content: [{ type: "text", text: `User In slot ${slot}: ${src.sourceLabel} (raw ${src.source})` }],
+                };
+            }
+
+            case "osc_set_user_routing_in": {
+                const { slot, source } = args as { slot: number; source: number | string };
+                await osc.setUserRoutingIn(slot, source);
+                return {
+                    content: [{ type: "text", text: `Set User In slot ${slot} source to ${source}` }],
+                };
+            }
+
+            case "osc_list_routing_sources": {
+                const userIn: Record<string, number> = { OFF: 0 };
+                for (let i = 1; i <= 32; i++) userIn[`Local ${i}`] = i;
+                for (let i = 1; i <= 48; i++) userIn[`AES50A ${i}`] = 32 + i;
+                for (let i = 1; i <= 48; i++) userIn[`AES50B ${i}`] = 80 + i;
+                for (let i = 1; i <= 32; i++) userIn[`Card ${i}`] = 128 + i;
+                for (let i = 1; i <= 8; i++) userIn[`AUX In ${i}`] = 160 + i;
+                const blockEnum: Record<number, string> = {};
+                for (let n = 0; n <= 24; n++) blockEnum[n] = (await import("./osc-client.js")).decodeBlockInSource(n);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `User In source codes (for /config/userrout/in/NN):\n${JSON.stringify(userIn, null, 2)}\n\nBlock-level routing enum (for /config/routing/IN, AES50A, AES50B, CARD blocks):\n${JSON.stringify(blockEnum, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_get_user_routing_out": {
+                const { slot } = args as { slot: number };
+                const src = await osc.getUserRoutingOut(slot);
+                return {
+                    content: [{ type: "text", text: `User Out slot ${slot}: ${src.sourceLabel} (raw ${src.source})` }],
+                };
+            }
+
+            case "osc_set_user_routing_out": {
+                const { slot, source } = args as { slot: number; source: number };
+                await osc.setUserRoutingOut(slot, source);
+                return {
+                    content: [{ type: "text", text: `Set User Out slot ${slot} source to ${source}` }],
+                };
+            }
+
+            case "osc_get_full_fx_chain": {
+                const fxChain = await osc.getFullFxChain();
+                return {
+                    content: [{ type: "text", text: `Full FX chain:\n${JSON.stringify(fxChain, null, 2)}` }],
+                };
+            }
+
             case "osc_set_effect_on": {
                 const { effect, on } = args as {
                     effect: number;
@@ -1632,22 +2212,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         {
                             type: "text",
                             text: `Effect ${effect} ${on ? "enabled" : "disabled"}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_effect_mix": {
-                const { effect, mix } = args as {
-                    effect: number;
-                    mix: number;
-                };
-                await osc.setEffectMix(effect, mix);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set effect ${effect} mix to ${(mix * 100).toFixed(1)}%`,
                         },
                     ],
                 };

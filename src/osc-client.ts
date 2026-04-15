@@ -1,5 +1,88 @@
 import OSC from "osc-js";
 
+// ========== Routing source encoders/decoders ==========
+// Confirmed against live X32 (firmware 2.07+) on 2026-04-14.
+// Probe data: slot 27 source 129 => X32-Edit label "Card 01" => 129-160 = Card 1-32.
+
+/**
+ * Decode a User In slot source code to a human label.
+ * Domain: /config/userrout/in/NN (0..168).
+ */
+export function decodeUserInSource(n: number): string {
+    if (n === 0) return "OFF";
+    if (n >= 1 && n <= 32) return `Local ${n}`;
+    if (n >= 33 && n <= 80) return `AES50A ${n - 32}`;
+    if (n >= 81 && n <= 128) return `AES50B ${n - 80}`;
+    if (n >= 129 && n <= 160) return `Card ${n - 128}`;
+    if (n >= 161 && n <= 168) return `AUX In ${n - 160}`;
+    return `UNKNOWN(${n})`;
+}
+
+/**
+ * Encode a human label back to a User In source code.
+ * Accepts labels like "Card 1", "Local 27", "AES50A 5", "AES50B 12", "AUX In 3", "OFF".
+ * Case-insensitive, tolerant of extra spaces.
+ */
+export function encodeUserInSource(label: string | number): number {
+    if (typeof label === "number") return label;
+    const s = label.trim().toUpperCase().replace(/\s+/g, " ");
+    if (s === "OFF" || s === "0") return 0;
+    const m = s.match(/^(LOCAL|AES50A|AES50B|CARD|AUX IN|AUX)\s*(\d+)$/);
+    if (!m) throw new Error(`Cannot parse User In source label: "${label}". Expected e.g. "Card 1", "Local 27", "AES50A 5", "OFF".`);
+    const kind = m[1];
+    const n = parseInt(m[2], 10);
+    if (kind === "LOCAL") {
+        if (n < 1 || n > 32) throw new Error(`Local out of range: ${n}`);
+        return n;
+    }
+    if (kind === "AES50A") {
+        if (n < 1 || n > 48) throw new Error(`AES50A out of range: ${n}`);
+        return 32 + n;
+    }
+    if (kind === "AES50B") {
+        if (n < 1 || n > 48) throw new Error(`AES50B out of range: ${n}`);
+        return 80 + n;
+    }
+    if (kind === "CARD") {
+        if (n < 1 || n > 32) throw new Error(`Card out of range: ${n}`);
+        return 128 + n;
+    }
+    // AUX IN / AUX
+    if (n < 1 || n > 8) throw new Error(`AUX In out of range: ${n}`);
+    return 160 + n;
+}
+
+/**
+ * Decode a block-level routing selector (the 8-channel block value).
+ * Used by /config/routing/IN/*, /config/routing/AES50A/*, /config/routing/AES50B/*, /config/routing/CARD/*.
+ * Each block represents 8 channels; the value selects which source group feeds that block.
+ * Confirmed on live hardware: IN 1-8=20..IN 25-32=23 => User In 1-8..25-32.
+ */
+export function decodeBlockInSource(n: number): string {
+    if (n >= 0 && n <= 3) return `Local ${n * 8 + 1}-${n * 8 + 8}`;
+    if (n >= 4 && n <= 9) return `AES50A ${(n - 4) * 8 + 1}-${(n - 4) * 8 + 8}`;
+    if (n >= 10 && n <= 15) return `AES50B ${(n - 10) * 8 + 1}-${(n - 10) * 8 + 8}`;
+    if (n >= 16 && n <= 19) return `Card ${(n - 16) * 8 + 1}-${(n - 16) * 8 + 8}`;
+    if (n >= 20 && n <= 23) return `User In ${(n - 20) * 8 + 1}-${(n - 20) * 8 + 8}`;
+    if (n === 24) return "AUX In 1-6 / TB / USB";
+    return `UNKNOWN(${n})`;
+}
+
+/**
+ * Decode a User Out slot source code (output tap selection).
+ * Note: this enum is less fully verified than User In. Identity mapping (slot 1-32 = source 1-32)
+ * was observed on the live mixer, which matches the pmaillot spec for Out 1-32 taps,
+ * but ranges above 32 are best-effort and should be verified before relied upon.
+ */
+export function decodeUserOutSource(n: number): string {
+    if (n === 0) return "OFF";
+    if (n >= 1 && n <= 16) return `Out ${n} (Local)`;
+    if (n >= 17 && n <= 32) return `Out ${n}`;
+    if (n >= 33 && n <= 48) return `P16 ${n - 32}`;
+    if (n >= 49 && n <= 50) return n === 49 ? "Monitor L" : "Monitor R";
+    return `UNKNOWN(${n}) — see X32 OSC spec, not fully verified`;
+}
+
 export class OSCClient {
     private osc: any;
     private host: string;
@@ -13,6 +96,10 @@ export class OSCClient {
 
         // Create OSC instance with UDP plugin
         const plugin = new (OSC as any).DatagramPlugin({
+            open: {
+                host: "0.0.0.0",
+                port: 0,
+            },
             send: {
                 host: this.host,
                 port: this.port,
@@ -42,9 +129,10 @@ export class OSCClient {
     async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
             try {
-                // Open OSC connection (listening on any available port)
+                // Open OSC connection (listening on any available port, all interfaces)
                 this.osc.open({
-                    port: 0, // Use any available port
+                    host: "0.0.0.0",
+                    port: 0,
                 });
 
                 this.isConnected = true;
@@ -169,9 +257,19 @@ export class OSCClient {
         return value * 30 - 15;
     }
 
+    async getEQFrequency(channel: number, band: number): Promise<number> {
+        const path = `${this.getChannelPath(channel)}/eq/${band}/f`;
+        return await this.sendAndReceive(path);
+    }
+
     async setEQFrequency(channel: number, band: number, frequency: number): Promise<void> {
         const path = `${this.getChannelPath(channel)}/eq/${band}/f`;
         this.sendCommand(path, [frequency]);
+    }
+
+    async getEQQ(channel: number, band: number): Promise<number> {
+        const path = `${this.getChannelPath(channel)}/eq/${band}/q`;
+        return await this.sendAndReceive(path);
     }
 
     async setEQQ(channel: number, band: number, q: number): Promise<void> {
@@ -179,9 +277,20 @@ export class OSCClient {
         this.sendCommand(path, [q]);
     }
 
+    async getEQType(channel: number, band: number): Promise<number> {
+        const path = `${this.getChannelPath(channel)}/eq/${band}/type`;
+        return await this.sendAndReceive(path);
+    }
+
     async setEQType(channel: number, band: number, type: number): Promise<void> {
         const path = `${this.getChannelPath(channel)}/eq/${band}/type`;
         this.sendCommand(path, [type]);
+    }
+
+    async getEQOn(channel: number): Promise<boolean> {
+        const path = `${this.getChannelPath(channel)}/eq/on`;
+        const value = await this.sendAndReceive(path);
+        return value === 1;
     }
 
     async setEQOn(channel: number, on: boolean): Promise<void> {
@@ -378,19 +487,38 @@ export class OSCClient {
 
     // ========== Effects ==========
 
-    async setEffectOn(effect: number, on: boolean): Promise<void> {
-        const path = `/fx/${effect.toString().padStart(2, "0")}/on`;
-        this.sendCommand(path, [on ? 1 : 0]);
+    private getFxPath(effect: number): string {
+        return `/fx/${effect}`;
     }
 
-    async setEffectMix(effect: number, mix: number): Promise<void> {
-        const path = `/fx/${effect.toString().padStart(2, "0")}/mix`;
-        this.sendCommand(path, [mix]);
+    async getEffectType(effect: number): Promise<number> {
+        return await this.sendAndReceive(`${this.getFxPath(effect)}/type`);
+    }
+
+    // NOTE: X32 has no /fx/N/on or /fx/N/mix addresses. FX slots are always
+    // instantiated; "on/off" is controlled by whether the FX return fader/mute
+    // is up, and wet/dry is an internal FX parameter (varies by algorithm).
+    // Use getFxReturnStrip() to check if an FX is effectively active.
+
+    async setEffectOn(effect: number, on: boolean): Promise<void> {
+        // Rewired: mute/unmute the corresponding FX return channel
+        const fxrPath = `/fxrtn/${effect.toString().padStart(2, "0")}/mix/on`;
+        this.sendCommand(fxrPath, [on ? 1 : 0]);
+    }
+
+    async getEffectOn(effect: number): Promise<boolean> {
+        // Rewired: read the FX return channel mute state
+        const fxrPath = `/fxrtn/${effect.toString().padStart(2, "0")}/mix/on`;
+        const value = await this.sendAndReceive(fxrPath);
+        return value === 1;
     }
 
     async setEffectParam(effect: number, param: number, value: number): Promise<void> {
-        const path = `/fx/${effect.toString().padStart(2, "0")}/par/${param.toString().padStart(2, "0")}`;
-        this.sendCommand(path, [value]);
+        this.sendCommand(`${this.getFxPath(effect)}/par/${param.toString().padStart(2, "0")}`, [value]);
+    }
+
+    async getEffectParam(effect: number, param: number): Promise<number> {
+        return await this.sendAndReceive(`${this.getFxPath(effect)}/par/${param.toString().padStart(2, "0")}`);
     }
 
     // ========== Routing ==========
@@ -457,6 +585,447 @@ export class OSCClient {
                 error: error instanceof Error ? error.message : String(error),
             };
         }
+    }
+
+    // ========== Bulk Reads ==========
+
+    private async safeRead(address: string): Promise<any> {
+        try { return await this.sendAndReceive(address); } catch { return null; }
+    }
+
+    private async readEQBands(path: string, bands: number = 4): Promise<any> {
+        const eqOn = await this.safeRead(`${path}/eq/on`);
+        const eq: any[] = [];
+        for (let b = 1; b <= bands; b++) {
+            eq.push({
+                band: b,
+                gain: await this.safeRead(`${path}/eq/${b}/g`),
+                freq: await this.safeRead(`${path}/eq/${b}/f`),
+                q: await this.safeRead(`${path}/eq/${b}/q`),
+                type: await this.safeRead(`${path}/eq/${b}/type`),
+            });
+        }
+        return { eqOn: eqOn === 1, eq };
+    }
+
+    async getChannelStrip(channel: number): Promise<any> {
+        const path = this.getChannelPath(channel);
+        const result: any = { channel };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/mix/fader`);
+        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
+        result.pan = await this.safeRead(`${path}/mix/pan`);
+        result.color = await this.safeRead(`${path}/config/color`);
+        result.source = await this.safeRead(`${path}/config/source`);
+
+        // Headamp (preamp gain + phantom)
+        const src = result.source;
+        if (src !== null && src >= 0 && src < 64) {
+            result.headampGain = await this.safeRead(`/headamp/${src.toString().padStart(3, "0")}/gain`);
+            result.headampPhantom = await this.safeRead(`/headamp/${src.toString().padStart(3, "0")}/phantom`);
+        }
+
+        // EQ (4-band)
+        const eqData = await this.readEQBands(path, 4);
+        result.eqOn = eqData.eqOn;
+        result.eq = eqData.eq;
+
+        // Gate (full)
+        result.gateOn = (await this.safeRead(`${path}/gate/on`)) === 1;
+        result.gateThr = await this.safeRead(`${path}/gate/thr`);
+        result.gateRange = await this.safeRead(`${path}/gate/range`);
+        result.gateAttack = await this.safeRead(`${path}/gate/attack`);
+        result.gateHold = await this.safeRead(`${path}/gate/hold`);
+        result.gateRelease = await this.safeRead(`${path}/gate/release`);
+
+        // Compressor (full)
+        result.dynOn = (await this.safeRead(`${path}/dyn/on`)) === 1;
+        result.dynThr = await this.safeRead(`${path}/dyn/thr`);
+        result.dynRatio = await this.safeRead(`${path}/dyn/ratio`);
+        result.dynAttack = await this.safeRead(`${path}/dyn/attack`);
+        result.dynRelease = await this.safeRead(`${path}/dyn/release`);
+        result.dynKnee = await this.safeRead(`${path}/dyn/knee`);
+        result.dynGain = await this.safeRead(`${path}/dyn/gain`);
+
+        // Sends to buses (16 buses)
+        result.sends = [];
+        for (let b = 1; b <= 16; b++) {
+            const sendPath = `${path}/mix/${b.toString().padStart(2, "0")}`;
+            result.sends.push({
+                bus: b,
+                level: await this.safeRead(`${sendPath}/level`),
+                pan: await this.safeRead(`${sendPath}/pan`),
+                type: await this.safeRead(`${sendPath}/type`),
+            });
+        }
+
+        return result;
+    }
+
+    async getBusStrip(bus: number): Promise<any> {
+        const path = this.getBusPath(bus);
+        const result: any = { bus };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/mix/fader`);
+        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
+        result.pan = await this.safeRead(`${path}/mix/pan`);
+        result.color = await this.safeRead(`${path}/config/color`);
+
+        const eqData = await this.readEQBands(path, 4);
+        result.eqOn = eqData.eqOn;
+        result.eq = eqData.eq;
+
+        // Dynamics
+        result.dynOn = (await this.safeRead(`${path}/dyn/on`)) === 1;
+        result.dynThr = await this.safeRead(`${path}/dyn/thr`);
+        result.dynRatio = await this.safeRead(`${path}/dyn/ratio`);
+
+        return result;
+    }
+
+    async getAuxStrip(aux: number): Promise<any> {
+        const path = `/auxin/${aux.toString().padStart(2, "0")}`;
+        const result: any = { aux };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/mix/fader`);
+        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
+        result.pan = await this.safeRead(`${path}/mix/pan`);
+        result.color = await this.safeRead(`${path}/config/color`);
+        result.source = await this.safeRead(`${path}/config/source`);
+
+        return result;
+    }
+
+    async getFxReturnStrip(fxr: number): Promise<any> {
+        const path = `/fxrtn/${fxr.toString().padStart(2, "0")}`;
+        const result: any = { fxReturn: fxr };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/mix/fader`);
+        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
+        result.pan = await this.safeRead(`${path}/mix/pan`);
+        result.color = await this.safeRead(`${path}/config/color`);
+
+        return result;
+    }
+
+    async getMatrixStrip(mtx: number): Promise<any> {
+        const path = `/mtx/${mtx.toString().padStart(2, "0")}`;
+        const result: any = { matrix: mtx };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/mix/fader`);
+        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
+        result.pan = await this.safeRead(`${path}/mix/pan`);
+
+        const eqData = await this.readEQBands(path, 4);
+        result.eqOn = eqData.eqOn;
+        result.eq = eqData.eq;
+
+        return result;
+    }
+
+    async getDCA(dca: number): Promise<any> {
+        const path = `/dca/${dca}`;
+        const result: any = { dca };
+
+        result.name = await this.safeRead(`${path}/config/name`);
+        result.fader = await this.safeRead(`${path}/fader`);
+        result.on = (await this.safeRead(`${path}/on`)) === 1;
+        result.color = await this.safeRead(`${path}/config/color`);
+
+        return result;
+    }
+
+    async getMainStrip(): Promise<any> {
+        const result: any = { type: "main_stereo" };
+
+        result.fader = await this.safeRead("/main/st/mix/fader");
+        result.on = (await this.safeRead("/main/st/mix/on")) === 1;
+        result.pan = await this.safeRead("/main/st/mix/pan");
+
+        const eqData = await this.readEQBands("/main/st", 6);
+        result.eqOn = eqData.eqOn;
+        result.eq = eqData.eq;
+
+        // Dynamics
+        result.dynOn = (await this.safeRead("/main/st/dyn/on")) === 1;
+        result.dynThr = await this.safeRead("/main/st/dyn/thr");
+        result.dynRatio = await this.safeRead("/main/st/dyn/ratio");
+
+        // Mono bus
+        result.mono = {
+            fader: await this.safeRead("/main/m/mix/fader"),
+            on: (await this.safeRead("/main/m/mix/on")) === 1,
+        };
+
+        return result;
+    }
+
+    async getHeadamp(index: number): Promise<any> {
+        const path = `/headamp/${index.toString().padStart(3, "0")}`;
+        return {
+            index,
+            gain: await this.safeRead(`${path}/gain`),
+            phantom: (await this.safeRead(`${path}/phantom`)) === 1,
+        };
+    }
+
+    async getConsoleOverview(): Promise<any> {
+        const overview: any = {};
+
+        // All 32 channels - name, fader, mute only for speed
+        overview.channels = [];
+        for (let ch = 1; ch <= 32; ch++) {
+            const path = this.getChannelPath(ch);
+            overview.channels.push({
+                ch,
+                name: await this.safeRead(`${path}/config/name`),
+                fader: await this.safeRead(`${path}/mix/fader`),
+                on: (await this.safeRead(`${path}/mix/on`)) === 1,
+            });
+        }
+
+        // 16 mix buses
+        overview.buses = [];
+        for (let b = 1; b <= 16; b++) {
+            const path = this.getBusPath(b);
+            overview.buses.push({
+                bus: b,
+                name: await this.safeRead(`${path}/config/name`),
+                fader: await this.safeRead(`${path}/mix/fader`),
+                on: (await this.safeRead(`${path}/mix/on`)) === 1,
+            });
+        }
+
+        // 8 DCA groups
+        overview.dcas = [];
+        for (let d = 1; d <= 8; d++) {
+            overview.dcas.push({
+                dca: d,
+                name: await this.safeRead(`/dca/${d}/config/name`),
+                fader: await this.safeRead(`/dca/${d}/fader`),
+                on: (await this.safeRead(`/dca/${d}/on`)) === 1,
+            });
+        }
+
+        // 6 matrices
+        overview.matrices = [];
+        for (let m = 1; m <= 6; m++) {
+            const path = `/mtx/${m.toString().padStart(2, "0")}`;
+            overview.matrices.push({
+                matrix: m,
+                name: await this.safeRead(`${path}/config/name`),
+                fader: await this.safeRead(`${path}/mix/fader`),
+                on: (await this.safeRead(`${path}/mix/on`)) === 1,
+            });
+        }
+
+        // 8 aux inputs
+        overview.auxInputs = [];
+        for (let a = 1; a <= 8; a++) {
+            const path = `/auxin/${a.toString().padStart(2, "0")}`;
+            overview.auxInputs.push({
+                aux: a,
+                name: await this.safeRead(`${path}/config/name`),
+                fader: await this.safeRead(`${path}/mix/fader`),
+                on: (await this.safeRead(`${path}/mix/on`)) === 1,
+            });
+        }
+
+        // 8 FX returns
+        overview.fxReturns = [];
+        for (let f = 1; f <= 8; f++) {
+            const path = `/fxrtn/${f.toString().padStart(2, "0")}`;
+            overview.fxReturns.push({
+                fxReturn: f,
+                name: await this.safeRead(`${path}/config/name`),
+                fader: await this.safeRead(`${path}/mix/fader`),
+                on: (await this.safeRead(`${path}/mix/on`)) === 1,
+            });
+        }
+
+        // 8 FX slots
+        overview.fxSlots = [];
+        for (let fx = 1; fx <= 8; fx++) {
+            overview.fxSlots.push({
+                slot: fx,
+                type: await this.safeRead(`/fx/${fx}/type`),
+            });
+        }
+
+        // Main
+        overview.main = {
+            fader: await this.safeRead("/main/st/mix/fader"),
+            on: (await this.safeRead("/main/st/mix/on")) === 1,
+            monoFader: await this.safeRead("/main/m/mix/fader"),
+            monoOn: (await this.safeRead("/main/m/mix/on")) === 1,
+        };
+
+        return overview;
+    }
+
+    async getRouting(): Promise<any> {
+        const routing: any = {};
+
+        // FX source assignments (FX 1-4 are stereo insert, 5-8 are dual mono)
+        routing.fxSources = [];
+        for (let fx = 1; fx <= 4; fx++) {
+            routing.fxSources.push({
+                slot: fx,
+                sourceL: await this.safeRead(`/fx/${fx}/source/l`),
+                sourceR: await this.safeRead(`/fx/${fx}/source/r`),
+            });
+        }
+        // FX 5-8 are inserted on channels, different structure
+        for (let fx = 5; fx <= 8; fx++) {
+            routing.fxSources.push({
+                slot: fx,
+                source: await this.safeRead(`/fx/${fx}/source`),
+            });
+        }
+
+        // Output routing blocks
+        routing.outputs = {};
+        for (const block of ["1-4", "5-8", "9-12", "13-16"]) {
+            routing.outputs[`OUT_${block}`] = await this.safeRead(`/config/routing/OUT/${block}`);
+        }
+
+        // Input routing blocks (decoded)
+        routing.inputs = {};
+        for (const block of ["1-8", "9-16", "17-24", "25-32"]) {
+            const raw = await this.safeRead(`/config/routing/IN/${block}`);
+            routing.inputs[`IN_${block}`] = { raw, label: raw === null ? null : decodeBlockInSource(raw) };
+        }
+
+        // AES50 routing (decoded using same block-in enum)
+        routing.aes50a = {};
+        for (const block of ["1-8", "9-16", "17-24", "25-32", "33-40", "41-48"]) {
+            const raw = await this.safeRead(`/config/routing/AES50A/${block}`);
+            routing.aes50a[`AES50A_${block}`] = { raw, label: raw === null ? null : decodeBlockInSource(raw) };
+        }
+        routing.aes50b = {};
+        for (const block of ["1-8", "9-16", "17-24", "25-32", "33-40", "41-48"]) {
+            const raw = await this.safeRead(`/config/routing/AES50B/${block}`);
+            routing.aes50b[`AES50B_${block}`] = { raw, label: raw === null ? null : decodeBlockInSource(raw) };
+        }
+
+        // Card routing (decoded)
+        routing.card = {};
+        for (const block of ["1-8", "9-16", "17-24", "25-32"]) {
+            const raw = await this.safeRead(`/config/routing/CARD/${block}`);
+            routing.card[`CARD_${block}`] = { raw, label: raw === null ? null : decodeBlockInSource(raw) };
+        }
+
+        return routing;
+    }
+
+    // User-defined routing (firmware 4.0+): per-slot patches for the "User In"
+    // and "User Out" blocks. When a routing block is set to source type
+    // "USER IN" / "USER OUT", these tables determine the actual per-channel source.
+    async getUserRouting(): Promise<any> {
+        const userRouting: any = { userIn: [], userOut: [] };
+
+        for (let slot = 1; slot <= 32; slot++) {
+            const source = await this.safeRead(`/config/userrout/in/${slot.toString().padStart(2, "0")}`);
+            userRouting.userIn.push({
+                slot,
+                source,
+                sourceLabel: source === null ? null : decodeUserInSource(source),
+            });
+        }
+
+        for (let slot = 1; slot <= 48; slot++) {
+            const source = await this.safeRead(`/config/userrout/out/${slot.toString().padStart(2, "0")}`);
+            userRouting.userOut.push({
+                slot,
+                source,
+                sourceLabel: source === null ? null : decodeUserOutSource(source),
+            });
+        }
+
+        return userRouting;
+    }
+
+    /**
+     * Set a User In slot's source. Accepts either a raw int (0..168) or a label like "Card 1", "Local 27", "AES50A 5", "OFF".
+     */
+    async setUserRoutingIn(slot: number, source: number | string): Promise<void> {
+        const code = encodeUserInSource(source);
+        const path = `/config/userrout/in/${slot.toString().padStart(2, "0")}`;
+        this.sendCommand(path, [code]);
+    }
+
+    async getUserRoutingIn(slot: number): Promise<{ source: number; sourceLabel: string }> {
+        const path = `/config/userrout/in/${slot.toString().padStart(2, "0")}`;
+        const source = await this.sendAndReceive(path);
+        return { source, sourceLabel: decodeUserInSource(source) };
+    }
+
+    async setUserRoutingOut(slot: number, source: number): Promise<void> {
+        const path = `/config/userrout/out/${slot.toString().padStart(2, "0")}`;
+        this.sendCommand(path, [source]);
+    }
+
+    async getUserRoutingOut(slot: number): Promise<{ source: number; sourceLabel: string }> {
+        const path = `/config/userrout/out/${slot.toString().padStart(2, "0")}`;
+        const source = await this.sendAndReceive(path);
+        return { source, sourceLabel: decodeUserOutSource(source) };
+    }
+
+    async getFullFxChain(): Promise<any[]> {
+        // For each FX slot: type, source assignment, params, and FX return state
+        const chains: any[] = [];
+        for (let fx = 1; fx <= 8; fx++) {
+            const chain: any = { slot: fx };
+
+            // FX type and params
+            chain.type = await this.safeRead(`/fx/${fx}/type`);
+            chain.params = [];
+            for (let p = 1; p <= 16; p++) {
+                const val = await this.safeRead(`/fx/${fx}/par/${p.toString().padStart(2, "0")}`);
+                if (val !== null) chain.params.push({ param: p, value: val });
+            }
+
+            // Source assignment
+            if (fx <= 4) {
+                chain.sourceL = await this.safeRead(`/fx/${fx}/source/l`);
+                chain.sourceR = await this.safeRead(`/fx/${fx}/source/r`);
+            } else {
+                chain.source = await this.safeRead(`/fx/${fx}/source`);
+            }
+
+            // FX return state
+            const fxrPath = `/fxrtn/${fx.toString().padStart(2, "0")}`;
+            chain.returnFader = await this.safeRead(`${fxrPath}/mix/fader`);
+            chain.returnOn = (await this.safeRead(`${fxrPath}/mix/on`)) === 1;
+            chain.returnName = await this.safeRead(`${fxrPath}/config/name`);
+
+            chains.push(chain);
+        }
+        return chains;
+    }
+
+    async getAllEffects(): Promise<any[]> {
+        const effects: any[] = [];
+        for (let fx = 1; fx <= 8; fx++) {
+            const slot: any = { slot: fx };
+            try { slot.type = await this.getEffectType(fx); } catch { slot.type = null; }
+            slot.params = [];
+            for (let p = 1; p <= 8; p++) {
+                try {
+                    const val = await this.getEffectParam(fx, p);
+                    slot.params.push({ param: p, value: val });
+                } catch {
+                    slot.params.push({ param: p, value: null });
+                }
+            }
+            effects.push(slot);
+        }
+        return effects;
     }
 
     // ========== Custom Commands ==========
