@@ -414,7 +414,7 @@ export const FX_ALGORITHM_SCHEMA: FxAlgorithmEntry[] = [
     },
     {
         code: 18, name: "ROTA", description: "Rotary speaker",
-        slots: { stereo: true, insert: true },
+        slots: { stereo: true, insert: false },
         params: [
             { name: "loSpeed", type: "float", range: [0.1, 4], unit: "Hz" },
             { name: "hiSpeed", type: "float", range: [2, 10], unit: "Hz" },
@@ -948,7 +948,7 @@ export const FX_ALGORITHM_SCHEMA: FxAlgorithmEntry[] = [
     // ===== Pitch shifter (codes 59..60) =====
     {
         code: 59, name: "PIT2", description: "Dual pitch shifter",
-        slots: { stereo: true, insert: true },
+        slots: { stereo: true, insert: false },
         params: [
             ...pitchSide("A"),
             ...pitchSide("B"),
@@ -956,7 +956,7 @@ export const FX_ALGORITHM_SCHEMA: FxAlgorithmEntry[] = [
     },
     {
         code: 60, name: "PIT", description: "Stereo pitch shifter",
-        slots: { stereo: true, insert: true },
+        slots: { stereo: true, insert: false },
         params: pitchSide(""),
     },
 ];
@@ -1136,14 +1136,60 @@ function pitchSide(suffix: string): FieldDef[] {
     ];
 }
 
+// ---------- FX5..8 type code mapping ----------
+// Slots 5..8 are insert-only and use a DIFFERENT integer encoding than slots 1..4.
+// Same algorithm, different code (e.g. GEQ is code 28 in FX1..4 but code 1 in FX5..8).
+// Source: pmaillot Effects appendix "FX5...FX8" table (X32_OSC.pdf, 2021-06).
+//
+// Verified against firmware 4.13 on 2026-04-28: live console reported leaf
+// /fx/5/type=4 with /node fx/5/type="DES2" — matches FX5..8 row "4 DES2".
+//
+// Note: /node fx/N/type returns the SYMBOLIC name on any slot (slot-class-
+// independent). Prefer /node-symbolic reads to dodge this dual encoding.
+const FX5_TO_8_BY_CODE: Array<string> = [
+    "GEQ2", "GEQ", "TEQ2", "TEQ",      // 0..3 graphic + true graphic EQ
+    "DES2", "DES",                       // 4..5 de-essers
+    "P1A", "P1A2", "PQ5", "PQ5S",       // 6..9 Pultec/Xtec EQs
+    "WAVD", "LIM",                       // 10..11 dynamics
+    "FAC", "FAC1M", "FAC2",             // 12..14 Fairchild
+    "LEC", "LEC2",                       // 15..16 Leisure
+    "ULC", "ULC2",                       // 17..18 Ultimo
+    "ENH2", "ENH",                       // 19..20 enhancer
+    "EXC2", "EXC",                       // 21..22 exciter
+    "IMG", "EDI", "SON",                // 23..25 imager/Edison/SoundMaxer
+    "AMP2", "AMP",                       // 26..27 guitar amps
+    "DRV2", "DRV",                       // 28..29 tube stage
+    "PHAS", "FILT", "PAN", "SUB",       // 30..33 mod/util (also valid in FX1..4 with different codes)
+];
+
+const FX5_TO_8_BY_NAME = new Map<string, number>(
+    FX5_TO_8_BY_CODE.map((name, code) => [name, code]),
+);
+
+/** Returns true if the slot is an insert-class FX slot (5..8). */
+export function isInsertSlot(slot: number): boolean {
+    return slot >= 5 && slot <= 8;
+}
+
+/** Returns true if the slot is a stereo FX slot (1..4). */
+export function isStereoSlot(slot: number): boolean {
+    return slot >= 1 && slot <= 4;
+}
+
 // ---------- lookup helpers ----------
 
-const BY_CODE = new Map<number, FxAlgorithmEntry>(FX_ALGORITHM_SCHEMA.map((e) => [e.code, e]));
+const BY_FX1_4_CODE = new Map<number, FxAlgorithmEntry>(FX_ALGORITHM_SCHEMA.map((e) => [e.code, e]));
 const BY_NAME = new Map<string, FxAlgorithmEntry>(FX_ALGORITHM_SCHEMA.map((e) => [e.name.toUpperCase(), e]));
 
-/** Look up an FX algorithm by its integer type code. Returns null if unknown. */
+/**
+ * Look up an FX algorithm by its integer type code in the FX1..4 numbering
+ * (the original Phase D' map). Returns null if unknown.
+ *
+ * NOTE: this is the FX1..4 mapping. For slot 5..8 reads, the leaf int code
+ * uses a different table — use findFxBySlotAndCode(slot, code) instead.
+ */
 export function findFxByCode(code: number): FxAlgorithmEntry | null {
-    return BY_CODE.get(code) ?? null;
+    return BY_FX1_4_CODE.get(code) ?? null;
 }
 
 /** Look up an FX algorithm by symbolic name (case-insensitive). Returns null if unknown. */
@@ -1152,24 +1198,80 @@ export function findFxByName(name: string): FxAlgorithmEntry | null {
 }
 
 /**
- * Resolve an FX type identifier — accepts either the symbolic name ("HALL") or
- * the integer type code (0). Returns the entry, or throws if neither matches.
+ * Slot-class-aware lookup. For slot 1..4 the integer is the FX1..4 code (0..60);
+ * for slot 5..8 the integer is the FX5..8 code (0..33) and resolves to the
+ * insert-suitable algorithm subset.
  */
-export function resolveFxType(typeRef: string | number): FxAlgorithmEntry {
-    if (typeof typeRef === "number") {
-        const e = findFxByCode(typeRef);
-        if (!e) throw new Error(`Unknown FX type code: ${typeRef} (valid: 0..${FX_ALGORITHM_SCHEMA.length - 1})`);
-        return e;
+export function findFxBySlotAndCode(slot: number, code: number): FxAlgorithmEntry | null {
+    if (isInsertSlot(slot)) {
+        const name = FX5_TO_8_BY_CODE[code];
+        if (!name) return null;
+        return findFxByName(name);
     }
-    // Try parse-as-number first ("0", "12") to be forgiving.
+    return findFxByCode(code);
+}
+
+/**
+ * Returns the slot-class-correct integer type code to write to /fx/N/type
+ * when setting `algo` on `slot`. Throws if `algo` isn't valid for the slot's
+ * class (e.g. trying to load a reverb into an insert slot).
+ */
+export function fxCodeForSlot(algo: FxAlgorithmEntry, slot: number): number {
+    if (isInsertSlot(slot)) {
+        if (!algo.slots.insert) {
+            throw new Error(`Algorithm "${algo.name}" is not insert-class — cannot load on slot ${slot}. Insert-suitable algos: ${FX5_TO_8_BY_CODE.join(", ")}`);
+        }
+        const code = FX5_TO_8_BY_NAME.get(algo.name);
+        if (code === undefined) {
+            throw new Error(`Internal: algorithm "${algo.name}" missing from FX5..8 code table`);
+        }
+        return code;
+    }
+    if (isStereoSlot(slot)) {
+        if (!algo.slots.stereo) {
+            throw new Error(`Algorithm "${algo.name}" is not stereo-class — cannot load on slot ${slot}.`);
+        }
+        return algo.code;
+    }
+    throw new Error(`Slot out of range: ${slot} (valid: 1..8)`);
+}
+
+/**
+ * Resolve an FX type identifier (symbolic name or integer code) for a given slot.
+ * Slot context disambiguates the integer encoding (FX1..4 vs FX5..8 use different ints
+ * for the same algorithm). Symbolic names are slot-independent.
+ *
+ * Throws if the type doesn't exist OR if the type isn't valid for the slot's class.
+ */
+export function resolveFxType(typeRef: string | number, slot?: number): FxAlgorithmEntry {
+    let entry: FxAlgorithmEntry | null = null;
+    if (typeof typeRef === "number") {
+        if (slot !== undefined) {
+            entry = findFxBySlotAndCode(slot, typeRef);
+        } else {
+            entry = findFxByCode(typeRef);
+        }
+        if (!entry) {
+            const where = slot !== undefined ? ` for slot ${slot}` : "";
+            throw new Error(`Unknown FX type code: ${typeRef}${where}. Use osc_fx_list_algorithms to enumerate.`);
+        }
+        return entry;
+    }
+    // String input — try symbolic name first.
+    entry = findFxByName(String(typeRef));
+    if (entry) {
+        // If a slot was supplied, verify class compatibility.
+        if (slot !== undefined && isInsertSlot(slot) && !entry.slots.insert) {
+            throw new Error(`Algorithm "${entry.name}" is not valid for insert slot ${slot} (FX5..8). Insert-class algos: ${FX5_TO_8_BY_CODE.join(", ")}`);
+        }
+        return entry;
+    }
+    // Try parse-as-number fallback ("0", "12").
     const asNum = Number(typeRef);
     if (Number.isFinite(asNum) && Number.isInteger(asNum)) {
-        const e = findFxByCode(asNum);
-        if (e) return e;
+        return resolveFxType(asNum, slot);
     }
-    const e = findFxByName(String(typeRef));
-    if (!e) throw new Error(`Unknown FX type: "${typeRef}". Use osc_fx_list_algorithms to enumerate.`);
-    return e;
+    throw new Error(`Unknown FX type: "${typeRef}". Use osc_fx_list_algorithms to enumerate.`);
 }
 
 /** Filter the schema by a substring of name or description (case-insensitive). */
@@ -1180,6 +1282,12 @@ export function listFxAlgorithms(filter?: string): FxAlgorithmEntry[] {
         e.name.toLowerCase().includes(f) || e.description.toLowerCase().includes(f),
     );
 }
+
+/** Names of algorithms suitable for insert slots (5..8). */
+export const FX_INSERT_ALGORITHM_NAMES: string[] = [...FX5_TO_8_BY_CODE];
+
+/** Names of algorithm groups that implement a 31-band graphic EQ (used by insert-EQ helpers). */
+export const GEQ_ALGORITHM_NAMES = new Set(["GEQ", "GEQ2", "TEQ", "TEQ2"]);
 
 /** Total number of FX algorithms in the schema. */
 export const FX_ALGORITHM_COUNT = FX_ALGORITHM_SCHEMA.length;

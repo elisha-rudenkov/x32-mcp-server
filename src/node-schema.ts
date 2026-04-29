@@ -174,6 +174,42 @@ export const NODE_SCHEMA: NodeSchemaEntry[] = [
         ],
     },
     {
+        path: "bus/[01..16]/insert",
+        description: "Bus insert (FX patch point on mix bus)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "pos", type: "enum", values: INSERT_POS },
+            { name: "sel", type: "enum", values: INSERT_SEL, note: "OFF or FX slot side, e.g. FX5L, FX6, FX7L" },
+        ],
+    },
+    {
+        path: "mtx/[01..06]/insert",
+        description: "Matrix insert (FX patch point on matrix output)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "pos", type: "enum", values: INSERT_POS },
+            { name: "sel", type: "enum", values: INSERT_SEL },
+        ],
+    },
+    {
+        path: "main/st/insert",
+        description: "Main LR insert (FX patch point on stereo main)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "pos", type: "enum", values: INSERT_POS },
+            { name: "sel", type: "enum", values: INSERT_SEL },
+        ],
+    },
+    {
+        path: "main/m/insert",
+        description: "Main Mono insert (FX patch point on mono main)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "pos", type: "enum", values: INSERT_POS },
+            { name: "sel", type: "enum", values: INSERT_SEL },
+        ],
+    },
+    {
         path: "ch/[01..32]/preamp",
         description: "Preamp trim, polarity, high-pass filter",
         fields: [

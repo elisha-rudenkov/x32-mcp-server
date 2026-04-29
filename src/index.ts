@@ -941,6 +941,71 @@ const TOOLS: Tool[] = [
             required: ["slot", "type"],
         },
     },
+    // ========== Insert-effect surface (Phase D″) ==========
+    {
+        name: "osc_find_geq_slots",
+        description:
+            "Scan all 8 FX slots and return which ones currently host a 31-band graphic EQ algorithm (GEQ, GEQ2, TEQ, or TEQ2). FX rack contents are user-configurable — the same slot can host any compatible algorithm at different times. Use this to discover where a GEQ is loaded before routing it as an insert.",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_get_insert_state",
+        description:
+            "Read the current insert state of a target — bus / matrix / main / channel. Returns insert.on, insert.pos (PRE/POST), insert.sel (the FX slot this insert routes through), and the algorithm currently loaded in the routed FX slot. Use to inspect routing before insert-EQ operations or to verify an insert chain. Target syntax: \"bus 3\", \"main\", \"main mono\", \"mtx 1\", \"ch 5\".",
+        inputSchema: {
+            type: "object",
+            properties: {
+                target: {
+                    type: "string",
+                    description: "Insert target: \"bus N\" (1-16), \"main\" / \"main mono\", \"mtx N\" (1-6), \"ch N\" (1-32).",
+                },
+            },
+            required: ["target"],
+        },
+    },
+    {
+        name: "osc_insert_eq_get",
+        description:
+            "Read the 31-band graphic EQ inserted on a target. Resolves the target's insert.sel → FX slot dynamically; never assumes a specific slot. If no GEQ-class algorithm is in the routed slot, returns the inserted state with a message instead of throwing — slot contents are runtime-configurable. Returns bands keyed by ISO frequency label (\"20Hz\"..\"20kHz\") plus master gain. For dual GEQ2/TEQ2, returns separate channelA / channelB.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                target: {
+                    type: "string",
+                    description: "\"bus N\", \"main\", \"main mono\", \"mtx N\", or \"ch N\".",
+                },
+            },
+            required: ["target"],
+        },
+    },
+    {
+        name: "osc_insert_eq_set",
+        description:
+            "Write band gains to the GEQ inserted on a target. Bands keyed by ISO frequency label (\"20Hz\", \"31.5Hz\", \"1kHz\", \"20kHz\", etc.). Partial writes preserve untouched bands. For stereo GEQ/TEQ, pass `bands` and optional `master`. For dual GEQ2/TEQ2, pass `channelA` and/or `channelB` each with their own bands+master. The FX slot is discovered dynamically from the target's insert.sel — never hard-coded.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                target: { type: "string", description: "\"bus N\", \"main\", \"mtx N\", \"ch N\"." },
+                bands: { type: "object", description: "Stereo GEQ/TEQ — band label → gain dB (-15..+15). E.g. {\"1kHz\": 3, \"100Hz\": -2}", additionalProperties: { type: "number" } },
+                master: { type: "number", description: "Stereo GEQ/TEQ master gain dB (-15..+15)" },
+                channelA: { type: "object", description: "Dual GEQ2/TEQ2 channel A — { bands: {...}, master: N }", additionalProperties: true },
+                channelB: { type: "object", description: "Dual GEQ2/TEQ2 channel B — { bands: {...}, master: N }", additionalProperties: true },
+            },
+            required: ["target"],
+        },
+    },
+    {
+        name: "osc_insert_eq_reset",
+        description:
+            "Zero all 31 bands and master on the GEQ inserted at a target — flat EQ. Slot is discovered dynamically.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                target: { type: "string", description: "\"bus N\", \"main\", \"mtx N\", \"ch N\"." },
+            },
+            required: ["target"],
+        },
+    },
     // ========== Scene snapshot + audit (Phase C) ==========
     {
         name: "osc_scene_snapshot",
@@ -1866,6 +1931,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `FX slot ${slot}: ${result.type} (code ${result.typeCode}) — was code ${result.previousTypeCode}. NOTE: type change typically resets params; re-fetch with osc_fx_get if needed.`,
+                    }],
+                };
+            }
+
+            case "osc_find_geq_slots": {
+                const slots = await osc.findGeqSlots();
+                return {
+                    content: [{
+                        type: "text",
+                        text: slots.length === 0
+                            ? "No FX slot currently hosts a GEQ-class algorithm (GEQ/GEQ2/TEQ/TEQ2). Load one via osc_fx_set_type first."
+                            : `GEQ-class slots loaded:\n${JSON.stringify(slots, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_get_insert_state": {
+                const { target } = args as { target: string };
+                const state = await osc.getInsertState(target);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Insert state for ${state.target}:\n${JSON.stringify(state, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_insert_eq_get": {
+                const { target } = args as { target: string };
+                const result = await osc.insertEqGet(target);
+                return {
+                    content: [{
+                        type: "text",
+                        text: result.message
+                            ? `${result.target}: ${result.message}\n${JSON.stringify(result, null, 2)}`
+                            : `Insert EQ on ${result.target} (${result.type} on FX${result.slot}):\n${JSON.stringify(result, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_insert_eq_set": {
+                const { target, bands, master, channelA, channelB } = args as {
+                    target: string;
+                    bands?: Record<string, number>;
+                    master?: number;
+                    channelA?: { bands?: Record<string, number>; master?: number };
+                    channelB?: { bands?: Record<string, number>; master?: number };
+                };
+                const r = await osc.insertEqSet(target, { bands, master, channelA, channelB });
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Wrote ${r.wrote.length} band(s) to ${r.target} (${r.type} on FX${r.slot}): ${r.wrote.join(", ")}`,
+                    }],
+                };
+            }
+
+            case "osc_insert_eq_reset": {
+                const { target } = args as { target: string };
+                const r = await osc.insertEqReset(target);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Reset ${r.target} GEQ (${r.type} on FX${r.slot}) — ${r.wrote.length} bands flattened.`,
                     }],
                 };
             }

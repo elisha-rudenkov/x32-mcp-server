@@ -11,9 +11,13 @@ import {
 import {
     FX_ALGORITHM_COUNT,
     FxAlgorithmEntry,
-    findFxByCode,
+    findFxByName,
+    findFxBySlotAndCode,
+    fxCodeForSlot,
+    isInsertSlot,
     listFxAlgorithms as listFxAlgorithmsImpl,
     resolveFxType,
+    GEQ_ALGORITHM_NAMES,
 } from "./fx-schema.js";
 
 // ========== X32node reply parsers ==========
@@ -82,6 +86,72 @@ export function parseX32Bitmask(s: string): number {
 /** X32 boolean: "ON"/"OFF" → true/false. */
 export function parseX32Bool(s: string): boolean {
     return s === "ON" || s === "TRUE" || s === "1";
+}
+
+// ========== GEQ band-name helpers (Phase D″) ==========
+// The fx-schema names GEQ band fields as `band_20Hz`, `band_31_5Hz`, ...,
+// `band_1k`, `band_1k25`, ..., `band_20k`. Dual variants prefix the side
+// (`bandA_20Hz`, `bandB_1k`, etc.) These helpers translate between user-
+// friendly ISO frequency labels ("20Hz", "1kHz", "1.25k", "20kHz") and the
+// canonical schema-suffix form.
+
+const GEQ_BAND_FIELD_SUFFIXES = [
+    "20Hz", "25Hz", "31_5Hz", "40Hz", "50Hz", "63Hz", "80Hz", "100Hz", "125Hz", "160Hz",
+    "200Hz", "250Hz", "315Hz", "400Hz", "500Hz", "630Hz", "800Hz", "1kHz", "1k25Hz", "1k6Hz",
+    "2kHz", "2k5Hz", "3k15Hz", "4kHz", "5kHz", "6k3Hz", "8kHz", "10kHz", "12k5Hz", "16kHz", "20kHz",
+];
+
+const GEQ_USER_LABELS = [
+    "20Hz", "25Hz", "31.5Hz", "40Hz", "50Hz", "63Hz", "80Hz", "100Hz", "125Hz", "160Hz",
+    "200Hz", "250Hz", "315Hz", "400Hz", "500Hz", "630Hz", "800Hz", "1kHz", "1.25kHz", "1.6kHz",
+    "2kHz", "2.5kHz", "3.15kHz", "4kHz", "5kHz", "6.3kHz", "8kHz", "10kHz", "12.5kHz", "16kHz", "20kHz",
+];
+
+/** Resolve a user-typed band label to the schema field-suffix. */
+function resolveBandLabel(label: string): string | null {
+    // Normalize: strip whitespace, lowercase, accept both "1k" and "1kHz", "31.5" and "31_5".
+    const norm = label.trim().toLowerCase().replace(/hz$/, "").replace(/[._]/g, "_");
+    for (let i = 0; i < GEQ_USER_LABELS.length; i++) {
+        const u = GEQ_USER_LABELS[i].toLowerCase().replace(/hz$/, "").replace(/[._]/g, "_");
+        if (norm === u) return GEQ_BAND_FIELD_SUFFIXES[i];
+    }
+    // Also accept the schema-suffix form directly ("31_5Hz", "1k", "1k25Hz").
+    for (const s of GEQ_BAND_FIELD_SUFFIXES) {
+        const lower = s.toLowerCase().replace(/hz$/, "");
+        if (norm === lower) return s;
+    }
+    return null;
+}
+
+/** Convert a schema field name (e.g. "band_31_5Hz", "bandA_1kHz") to the user label "31.5Hz" / "1kHz". */
+function fieldToUserLabel(suffix: string): string {
+    const idx = GEQ_BAND_FIELD_SUFFIXES.indexOf(suffix);
+    return idx >= 0 ? GEQ_USER_LABELS[idx] : suffix;
+}
+
+/** Pluck the bands + master for one side ("" / "A" / "B") out of a fxGet params dict. */
+function extractGeqSide(params: Record<string, any>, side: string): { bands: Record<string, number>; master: number } {
+    const bands: Record<string, number> = {};
+    for (const sfx of GEQ_BAND_FIELD_SUFFIXES) {
+        const key = `band${side}_${sfx}`;
+        if (key in params) bands[fieldToUserLabel(sfx)] = params[key];
+    }
+    const masterKey = side === "" ? "master" : `master${side}`;
+    return { bands, master: params[masterKey] ?? 0 };
+}
+
+/** Translate user-supplied band map ({"1kHz": +3}) to schema-keyed map ({band_1kHz: +3} or {bandA_1kHz: +3}). */
+function mapGeqBands(input: Record<string, number> | undefined, side: string): Record<string, number> {
+    if (!input) return {};
+    const out: Record<string, number> = {};
+    for (const [label, value] of Object.entries(input)) {
+        const sfx = resolveBandLabel(label);
+        if (!sfx) {
+            throw new Error(`Unknown GEQ band label: "${label}". Valid: ${GEQ_USER_LABELS.join(", ")}`);
+        }
+        out[`band${side}_${sfx}`] = value;
+    }
+    return out;
 }
 
 /** Encode a JS value for the /  (X32node write) command. Strings with whitespace get quoted. */
@@ -566,8 +636,26 @@ export class OSCClient {
         extraParams: string[];
     }> {
         if (slot < 1 || slot > 8) throw new Error(`FX slot out of range: ${slot} (valid: 1..8)`);
-        const typeCode = await this.sendAndReceive(`/fx/${slot}/type`);
-        const algo = findFxByCode(typeof typeCode === "number" ? typeCode : Number(typeCode));
+
+        // /node fx/N/type returns the SYMBOLIC name (e.g. "HALL", "DES2", "GEQ")
+        // regardless of slot class, sidestepping the FX1..4 vs FX5..8 dual integer
+        // encoding. The leaf /fx/N/type returns slot-class-specific ints.
+        const typeNode = await this.nodeRead(`fx/${slot}/type`);
+        const symbolic = typeNode.values[0];
+        const algo = symbolic ? findFxByName(symbolic) : null;
+
+        // Read leaf int too — useful for callers that want the raw code.
+        let leafCode = -1;
+        try {
+            const leaf = await this.sendAndReceive(`/fx/${slot}/type`);
+            leafCode = typeof leaf === "number" ? leaf : Number(leaf);
+        } catch {
+            // leaf read failed; fall back to schema-derived code per slot class
+            if (algo) {
+                try { leafCode = fxCodeForSlot(algo, slot); } catch { leafCode = -1; }
+            }
+        }
+
         const node = await this.nodeRead(`fx/${slot}/par`);
         const params: Record<string, any> = {};
         const extra: string[] = [];
@@ -588,8 +676,8 @@ export class OSCClient {
         }
         return {
             slot,
-            typeCode: typeof typeCode === "number" ? typeCode : Number(typeCode),
-            type: algo?.name ?? null,
+            typeCode: leafCode,
+            type: algo?.name ?? symbolic ?? null,
             description: algo?.description ?? null,
             params,
             extraParams: extra,
@@ -627,10 +715,12 @@ export class OSCClient {
         const paramNames = Object.keys(params);
         if (paramNames.length === 0) return { wrote: [], sent: [], type: "<no-write>" };
 
-        const typeCode = await this.sendAndReceive(`/fx/${slot}/type`);
-        const algo = findFxByCode(typeof typeCode === "number" ? typeCode : Number(typeCode));
+        // Read symbolic name via /node (slot-class-independent), then look up by name.
+        const typeNode = await this.nodeRead(`fx/${slot}/type`);
+        const symbolic = typeNode.values[0];
+        const algo = symbolic ? findFxByName(symbolic) : null;
         if (!algo) {
-            throw new Error(`FX slot ${slot} has unknown type code ${typeCode}; no schema match. Use osc_fx_list_algorithms to enumerate.`);
+            throw new Error(`FX slot ${slot} reported type "${symbolic}" — no schema match. Use osc_fx_list_algorithms to enumerate.`);
         }
 
         // Validate all param names up front so a typo can't half-apply.
@@ -675,17 +765,36 @@ export class OSCClient {
         slot: number;
         typeCode: number;
         type: string;
+        previousType: string | null;
         previousTypeCode: number;
     }> {
         if (slot < 1 || slot > 8) throw new Error(`FX slot out of range: ${slot} (valid: 1..8)`);
-        const algo = resolveFxType(typeRef);
-        const previous = await this.sendAndReceive(`/fx/${slot}/type`);
-        const previousTypeCode = typeof previous === "number" ? previous : Number(previous);
-        this.sendCommand(`/fx/${slot}/type`, [algo.code]);
+
+        // resolveFxType validates slot-class compatibility (e.g. rejects HALL on slot 5).
+        const algo = resolveFxType(typeRef, slot);
+        const slotCode = fxCodeForSlot(algo, slot);
+
+        // Capture previous state via /node-symbolic (slot-class-independent).
+        let previousType: string | null = null;
+        let previousTypeCode = -1;
+        try {
+            const prevNode = await this.nodeRead(`fx/${slot}/type`);
+            previousType = prevNode.values[0] ?? null;
+        } catch {}
+        try {
+            const prevLeaf = await this.sendAndReceive(`/fx/${slot}/type`);
+            previousTypeCode = typeof prevLeaf === "number" ? prevLeaf : Number(prevLeaf);
+        } catch {}
+
+        // Write the slot-class-correct integer to the leaf. (The X32 also accepts
+        // /node-style writes with the symbolic name, but the leaf int is the
+        // documented path and matches what setEffectParam etc. already use.)
+        this.sendCommand(`/fx/${slot}/type`, [slotCode]);
         return {
             slot,
-            typeCode: algo.code,
+            typeCode: slotCode,
             type: algo.name,
+            previousType,
             previousTypeCode,
         };
     }
@@ -698,6 +807,278 @@ export class OSCClient {
     /** Total number of FX algorithms in the schema. */
     fxAlgorithmCount(): number {
         return FX_ALGORITHM_COUNT;
+    }
+
+    // ========== Insert-effect surface (Phase D″) ==========
+
+    /**
+     * Discover all FX slots whose currently-loaded algorithm is a 31-band graphic EQ
+     * (GEQ, GEQ2, TEQ, or TEQ2). Slot-agnostic: the user can configure any of the
+     * 8 racks to host any compatible algorithm; this scan reads /fx/N/type for each
+     * and filters by name. Use as a probe before insert-EQ operations.
+     */
+    async findGeqSlots(): Promise<Array<{ slot: number; type: string }>> {
+        const out: Array<{ slot: number; type: string }> = [];
+        for (let n = 1; n <= 8; n++) {
+            try {
+                const node = await this.nodeRead(`fx/${n}/type`);
+                const sym = node.values[0];
+                if (sym && GEQ_ALGORITHM_NAMES.has(sym)) {
+                    out.push({ slot: n, type: sym });
+                }
+            } catch {
+                // skip — slot didn't respond
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Resolve a high-level insert target (e.g. "bus 3", "main", "main mono",
+     * "mtx 1", "ch 5") to the underlying /node container path.
+     * Throws on ambiguous or out-of-range labels.
+     */
+    private resolveInsertTarget(target: string): { path: string; label: string } {
+        const t = target.trim().toUpperCase();
+        if (t === "MAIN" || t === "MAIN LR" || t === "MAIN ST" || t === "MAIN STEREO") {
+            return { path: "main/st/insert", label: "Main LR" };
+        }
+        if (t === "MAIN M" || t === "MAIN MONO" || t === "MONO") {
+            return { path: "main/m/insert", label: "Main Mono" };
+        }
+        const busM = t.match(/^BUS\s*(\d+)$/);
+        if (busM) {
+            const n = parseInt(busM[1], 10);
+            if (n < 1 || n > 16) throw new Error(`Bus number out of range: ${n} (valid: 1..16)`);
+            return { path: `bus/${String(n).padStart(2, "0")}/insert`, label: `Bus ${n}` };
+        }
+        const mtxM = t.match(/^(MTX|MATRIX)\s*(\d+)$/);
+        if (mtxM) {
+            const n = parseInt(mtxM[2], 10);
+            if (n < 1 || n > 6) throw new Error(`Matrix number out of range: ${n} (valid: 1..6)`);
+            return { path: `mtx/${String(n).padStart(2, "0")}/insert`, label: `Matrix ${n}` };
+        }
+        const chM = t.match(/^(CH|CHANNEL)\s*(\d+)$/);
+        if (chM) {
+            const n = parseInt(chM[2], 10);
+            if (n < 1 || n > 32) throw new Error(`Channel number out of range: ${n} (valid: 1..32)`);
+            return { path: `ch/${String(n).padStart(2, "0")}/insert`, label: `Ch ${n}` };
+        }
+        throw new Error(`Cannot parse insert target: "${target}". Expected e.g. "bus 3", "main", "main mono", "mtx 1", "ch 5".`);
+    }
+
+    /**
+     * Parse an `insert.sel` enum value (e.g. "FX5L", "FX6", "FX7R", "OFF") to
+     * the integer FX slot it points to (1..8), or null if disconnected.
+     */
+    private parseInsertSel(sel: string): { slot: number; side: "L" | "R" | null } | null {
+        if (!sel || sel === "OFF") return null;
+        const m = sel.match(/^FX([1-8])([LR])?$/);
+        if (!m) return null;
+        return { slot: parseInt(m[1], 10), side: (m[2] as "L" | "R") ?? null };
+    }
+
+    /**
+     * Read the insert state of a target (bus / main / mtx / ch). Returns the
+     * insert.on / pos / sel along with the resolved FX slot (if any) and
+     * whether that slot currently hosts a GEQ-class algorithm.
+     */
+    async getInsertState(target: string): Promise<{
+        target: string;
+        path: string;
+        on: boolean;
+        pos: string;
+        sel: string;
+        fxSlot: number | null;
+        fxSide: "L" | "R" | null;
+        fxType: string | null;
+        isGeqClass: boolean;
+    }> {
+        const { path, label } = this.resolveInsertTarget(target);
+        const node = await this.nodeRead(path);
+        const on = node.values[0] === "ON";
+        const pos = node.values[1] ?? "PRE";
+        const sel = node.values[2] ?? "OFF";
+        const parsed = this.parseInsertSel(sel);
+        let fxType: string | null = null;
+        if (parsed) {
+            try {
+                const t = await this.nodeRead(`fx/${parsed.slot}/type`);
+                fxType = t.values[0] ?? null;
+            } catch {}
+        }
+        return {
+            target: label,
+            path,
+            on,
+            pos,
+            sel,
+            fxSlot: parsed?.slot ?? null,
+            fxSide: parsed?.side ?? null,
+            fxType,
+            isGeqClass: fxType !== null && GEQ_ALGORITHM_NAMES.has(fxType),
+        };
+    }
+
+    /**
+     * Read the 31-band graphic EQ inserted on a target.
+     *
+     * Steps:
+     *   1. Resolve target → /node insert.sel → FX slot (1..8).
+     *   2. Verify the discovered slot's algorithm is GEQ/GEQ2/TEQ/TEQ2.
+     *   3. Read /node fx/<slot>/par and decode the 31 bands + master per the algo's schema.
+     *
+     * For dual-mono GEQ2/TEQ2, returns separate `channelA` / `channelB` bands.
+     * For stereo GEQ/TEQ, both channels share the same gains — returned as a single `bands` map.
+     *
+     * Slot-agnostic: never assumes which slot has the GEQ. If the target's
+     * insert.sel doesn't point at a GEQ-class slot, returns the discovered
+     * insert state with `isGeqClass: false` and no bands.
+     */
+    async insertEqGet(target: string): Promise<{
+        target: string;
+        path: string;
+        slot: number | null;
+        type: string | null;
+        isGeqClass: boolean;
+        on: boolean;
+        pos: string;
+        bands?: Record<string, number>;
+        master?: number;
+        channelA?: { bands: Record<string, number>; master: number };
+        channelB?: { bands: Record<string, number>; master: number };
+        message?: string;
+    }> {
+        const insertState = await this.getInsertState(target);
+        if (!insertState.fxSlot) {
+            return {
+                target: insertState.target,
+                path: insertState.path,
+                slot: null,
+                type: null,
+                isGeqClass: false,
+                on: insertState.on,
+                pos: insertState.pos,
+                message: `${insertState.target} has no FX insert routed (sel=${insertState.sel})`,
+            };
+        }
+        if (!insertState.isGeqClass) {
+            return {
+                target: insertState.target,
+                path: insertState.path,
+                slot: insertState.fxSlot,
+                type: insertState.fxType,
+                isGeqClass: false,
+                on: insertState.on,
+                pos: insertState.pos,
+                message: `${insertState.target} insert points at FX${insertState.fxSlot} which hosts ${insertState.fxType}, not a GEQ-class algorithm. Load GEQ/GEQ2/TEQ/TEQ2 into FX${insertState.fxSlot} via osc_fx_set_type to use this tool.`,
+            };
+        }
+        const fx = await this.fxGet(insertState.fxSlot);
+        const params = fx.params;
+        const isDual = fx.type === "GEQ2" || fx.type === "TEQ2";
+        const result: any = {
+            target: insertState.target,
+            path: insertState.path,
+            slot: insertState.fxSlot,
+            type: fx.type,
+            isGeqClass: true,
+            on: insertState.on,
+            pos: insertState.pos,
+        };
+        if (isDual) {
+            result.channelA = extractGeqSide(params, "A");
+            result.channelB = extractGeqSide(params, "B");
+        } else {
+            result.bands = extractGeqSide(params, "").bands;
+            result.master = extractGeqSide(params, "").master;
+        }
+        return result;
+    }
+
+    /**
+     * Set bands on the GEQ inserted at a target. Accepts either:
+     *   { bands: { "1kHz": +3, "20Hz": -2 }, master: -1 }            (stereo / TEQ / GEQ)
+     *   { channelA: { bands: {...}, master: 0 }, channelB: { ... } } (dual / GEQ2 / TEQ2)
+     *
+     * Frequency keys can be ISO labels: "20Hz", "31.5Hz", "1k", "1kHz", "20kHz",
+     * "1.25k", etc. — all map to the same canonical band. Partial writes preserve
+     * untouched bands.
+     */
+    async insertEqSet(target: string, opts: {
+        bands?: Record<string, number>;
+        master?: number;
+        channelA?: { bands?: Record<string, number>; master?: number };
+        channelB?: { bands?: Record<string, number>; master?: number };
+    }): Promise<{ target: string; slot: number; type: string; wrote: string[] }> {
+        const insertState = await this.getInsertState(target);
+        if (!insertState.fxSlot) {
+            throw new Error(`${insertState.target} has no FX insert routed (sel=${insertState.sel}).`);
+        }
+        if (!insertState.isGeqClass) {
+            throw new Error(`${insertState.target} insert points at FX${insertState.fxSlot} which hosts ${insertState.fxType}, not a GEQ-class algorithm.`);
+        }
+        const slot = insertState.fxSlot;
+        const type = insertState.fxType!;
+        const isDual = type === "GEQ2" || type === "TEQ2";
+
+        const fxParams: Record<string, any> = {};
+        if (isDual) {
+            if (opts.bands || opts.master !== undefined) {
+                throw new Error(`${type} is dual-mono — pass channelA / channelB instead of bands / master.`);
+            }
+            if (opts.channelA) {
+                Object.assign(fxParams, mapGeqBands(opts.channelA.bands, "A"));
+                if (opts.channelA.master !== undefined) fxParams[`masterA`] = opts.channelA.master;
+            }
+            if (opts.channelB) {
+                Object.assign(fxParams, mapGeqBands(opts.channelB.bands, "B"));
+                if (opts.channelB.master !== undefined) fxParams[`masterB`] = opts.channelB.master;
+            }
+        } else {
+            if (opts.channelA || opts.channelB) {
+                throw new Error(`${type} is stereo — pass bands / master directly, not channelA / channelB.`);
+            }
+            Object.assign(fxParams, mapGeqBands(opts.bands, ""));
+            if (opts.master !== undefined) fxParams[`master`] = opts.master;
+        }
+        if (Object.keys(fxParams).length === 0) {
+            throw new Error("No bands or master specified — nothing to write.");
+        }
+        const result = await this.fxSet(slot, fxParams);
+        return { target: insertState.target, slot, type, wrote: result.wrote };
+    }
+
+    /**
+     * Reset all 31 bands and master(s) on the GEQ inserted at a target to 0 dB.
+     */
+    async insertEqReset(target: string): Promise<{ target: string; slot: number; type: string; wrote: string[] }> {
+        const insertState = await this.getInsertState(target);
+        if (!insertState.fxSlot) {
+            throw new Error(`${insertState.target} has no FX insert routed (sel=${insertState.sel}).`);
+        }
+        if (!insertState.isGeqClass) {
+            throw new Error(`${insertState.target} insert points at FX${insertState.fxSlot} which hosts ${insertState.fxType}, not a GEQ-class algorithm.`);
+        }
+        const slot = insertState.fxSlot;
+        const type = insertState.fxType!;
+        const isDual = type === "GEQ2" || type === "TEQ2";
+        const fxParams: Record<string, any> = {};
+        if (isDual) {
+            for (const f of GEQ_BAND_FIELD_SUFFIXES) {
+                fxParams[`bandA_${f}`] = 0;
+                fxParams[`bandB_${f}`] = 0;
+            }
+            fxParams.masterA = 0;
+            fxParams.masterB = 0;
+        } else {
+            for (const f of GEQ_BAND_FIELD_SUFFIXES) {
+                fxParams[`band_${f}`] = 0;
+            }
+            fxParams.master = 0;
+        }
+        const result = await this.fxSet(slot, fxParams);
+        return { target: insertState.target, slot, type, wrote: result.wrote };
     }
 
     // ========== Composite signal-flow diagnostics (Phase B) ==========
