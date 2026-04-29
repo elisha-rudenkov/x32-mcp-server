@@ -69,6 +69,9 @@ const INSERT_SEL: string[] = [
     "FX5L", "FX5R", "FX6L", "FX6R", "FX7L", "FX7R", "FX8L", "FX8R",
 ];
 
+// Automix group enum — auxin uses same shape as ch/NN/automix
+const AUTOMIX = ["OFF", "X", "Y"];
+
 export const NODE_SCHEMA: NodeSchemaEntry[] = [
     // ========== Channel containers ==========
     {
@@ -235,6 +238,342 @@ export const NODE_SCHEMA: NodeSchemaEntry[] = [
         fields: [
             { name: "gain", type: "db", range: [-12, 60], unit: "dB" },
             { name: "phantom", type: "bool", note: "+48 V" },
+        ],
+    },
+
+    // ========== Bus containers ==========
+    {
+        path: "bus/[01..16]/config",
+        description: "Mix bus name, icon, color (no source field — buses are internal)",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+    {
+        path: "bus/[01..16]/mix",
+        description: "Mix bus master mix — on, fader, st-send, pan, mono-send, mono-level",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "st", type: "bool", note: "to-LR send enable" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "mono", type: "bool" },
+            { name: "mlevel", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "bus/[01..16]/grp",
+        description: "Bus DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+    // Bus sends to matrix (BB 01..06): odd has full 5 fields, even has 2.
+    {
+        path: "bus/[01..16]/mix/[01..05:odd]",
+        description: "Bus send to matrix (odd BB — head of matrix pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "type", type: "enum", values: TAP_TYPES },
+            { name: "panFollow", type: "int", range: [0, 1] },
+        ],
+    },
+    {
+        path: "bus/[01..16]/mix/[02..06:even]",
+        description: "Bus send to matrix (even BB — tail of matrix pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+
+    // ========== Aux input containers ==========
+    {
+        path: "auxin/[01..08]/config",
+        description: "Aux input name, icon, color, source (4 fields — auxin has source like channels)",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+            { name: "source", type: "int", range: [0, 168], note: "physical input slot" },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/preamp",
+        description: "Aux input preamp — trim and polarity invert (no HPF on auxin)",
+        fields: [
+            { name: "trim", type: "db", range: [-18, 18], unit: "dB" },
+            { name: "invert", type: "bool" },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/mix",
+        description: "Aux input main mix — same shape as channel mix",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "st", type: "bool" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "mono", type: "bool" },
+            { name: "mlevel", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/grp",
+        description: "Aux input DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/automix",
+        description: "Aux input automix group assignment",
+        fields: [
+            { name: "group", type: "enum", values: AUTOMIX },
+            { name: "weight", type: "db", range: [-12, 12], unit: "dB" },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/mix/[01..15:odd]",
+        description: "Aux input send to bus (odd BB — head of bus pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "type", type: "enum", values: TAP_TYPES },
+            { name: "panFollow", type: "int", range: [0, 1] },
+        ],
+    },
+    {
+        path: "auxin/[01..08]/mix/[02..16:even]",
+        description: "Aux input send to bus (even BB — tail of bus pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+
+    // ========== FX return containers ==========
+    {
+        path: "fxrtn/[01..08]/config",
+        description: "FX return name, icon, color (3 fields — no source; tied to FX slot output)",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+    {
+        path: "fxrtn/[01..08]/mix",
+        description: "FX return main mix — same shape as channel mix",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "st", type: "bool" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "mono", type: "bool" },
+            { name: "mlevel", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "fxrtn/[01..08]/grp",
+        description: "FX return DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+    {
+        path: "fxrtn/[01..08]/mix/[01..15:odd]",
+        description: "FX return send to bus (odd BB — head of bus pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "type", type: "enum", values: TAP_TYPES },
+            { name: "panFollow", type: "int", range: [0, 1] },
+        ],
+    },
+    {
+        path: "fxrtn/[01..08]/mix/[02..16:even]",
+        description: "FX return send to bus (even BB — tail of bus pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+
+    // ========== Matrix containers ==========
+    {
+        path: "mtx/[01..06]/config",
+        description: "Matrix name, icon, color",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+    {
+        path: "mtx/[01..06]/mix",
+        description: "Matrix master — on and fader only (no panning at matrix output)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "mtx/[01..06]/grp",
+        description: "Matrix DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+
+    // ========== Main containers ==========
+    {
+        path: "main/st/config",
+        description: "Main stereo (LR) name, icon, color",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+    {
+        path: "main/m/config",
+        description: "Main mono (Center/Sub) name, icon, color",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+    {
+        path: "main/st/mix",
+        description: "Main LR — on, fader, pan (3 fields; no st/mono/mlevel since main IS the destination)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "pan", type: "int", range: [-100, 100] },
+        ],
+    },
+    {
+        path: "main/m/mix",
+        description: "Main Mono — on and fader only",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "main/st/grp",
+        description: "Main LR DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+    {
+        path: "main/m/grp",
+        description: "Main Mono DCA / mute group memberships",
+        fields: [
+            { name: "dca", type: "bitmask" },
+            { name: "mute", type: "bitmask" },
+        ],
+    },
+    {
+        path: "main/st/mix/[01..05:odd]",
+        description: "Main LR send to matrix (odd BB — head of matrix pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+            { name: "pan", type: "int", range: [-100, 100] },
+            { name: "type", type: "enum", values: TAP_TYPES },
+            { name: "panFollow", type: "int", range: [0, 1] },
+        ],
+    },
+    {
+        path: "main/st/mix/[02..06:even]",
+        description: "Main LR send to matrix (even BB — tail of matrix pair)",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "level", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+
+    // ========== DCA containers ==========
+    {
+        path: "dca/[1..8]",
+        description: "DCA master state — on/off and fader",
+        fields: [
+            { name: "on", type: "bool" },
+            { name: "fader", type: "db", range: [-90, 10], unit: "dB" },
+        ],
+    },
+    {
+        path: "dca/[1..8]/config",
+        description: "DCA name, icon, color",
+        fields: [
+            { name: "name", type: "string" },
+            { name: "icon", type: "int", range: [1, 74] },
+            { name: "color", type: "enum", values: COLORS },
+        ],
+    },
+
+    // ========== Physical output containers ==========
+    // src field is the X32 output-tap source enum (different from User Out enum):
+    //   0=OFF; 1=MainL; 2=MainR; 3=MainC; 4..19=MX1..16; 20..25=MTX1..6;
+    //   26..57=Ch01..32; higher values are AuxIn/FX/USB (best-effort).
+    // pos values verified on live console: POST and <-EQ; spec also allows PRE, EQ->, DYN->, <-DYN.
+    {
+        path: "outputs/main/[01..16]",
+        description: "Physical OUT 1-16 — source tap, tap position, polarity invert",
+        fields: [
+            { name: "src", type: "int", range: [0, 96], note: "output tap source enum; see decodeOutputTapSource" },
+            { name: "pos", type: "enum", values: TAP_TYPES },
+            { name: "invert", type: "bool", note: "polarity invert" },
+        ],
+    },
+    {
+        path: "outputs/aux/[01..06]",
+        description: "Physical AUX OUT 1-6 — source tap, tap position, polarity invert",
+        fields: [
+            { name: "src", type: "int", range: [0, 96] },
+            { name: "pos", type: "enum", values: TAP_TYPES },
+            { name: "invert", type: "bool" },
+        ],
+    },
+    {
+        path: "outputs/p16/[01..16]",
+        description: "P16 personal-monitor outputs 1-16 — source tap, tap position, polarity invert",
+        fields: [
+            { name: "src", type: "int", range: [0, 96] },
+            { name: "pos", type: "enum", values: TAP_TYPES },
+            { name: "invert", type: "bool" },
+        ],
+    },
+    {
+        path: "outputs/aes/[01..02]",
+        description: "AES50 / AES out — source tap, tap position, polarity invert",
+        fields: [
+            { name: "src", type: "int", range: [0, 96] },
+            { name: "pos", type: "enum", values: TAP_TYPES },
+            { name: "invert", type: "bool" },
+        ],
+    },
+    {
+        path: "outputs/rec/[01..02]",
+        description: "Recording outputs — source tap and tap position only (no invert)",
+        fields: [
+            { name: "src", type: "int", range: [0, 96] },
+            { name: "pos", type: "enum", values: TAP_TYPES },
         ],
     },
 

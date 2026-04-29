@@ -207,6 +207,27 @@ export function decodeUserOutSource(n: number): string {
     return `UNKNOWN(${n}) — see X32 OSC spec, not fully verified`;
 }
 
+/**
+ * Decode the X32 output-tap source enum used by `outputs/{main,aux,p16,aes,rec}/NN.src`.
+ * Verified by cross-referencing live mixer reads:
+ *   outputs/main/14=1 (MainL), 15=2 (MainR), 16=3 (MainC)
+ *   outputs/main/01=4 (MX1), 06=25 (MTX6)
+ *   outputs/p16/01=26 (Ch01), 14=54 (Ch29), 16=12 (MX9)
+ * Note: this enum is distinct from decodeUserOutSource (which decodes /config/userrout/out/NN).
+ */
+export function decodeOutputTapSource(n: number): string {
+    if (n === 0) return "OFF";
+    if (n === 1) return "Main L";
+    if (n === 2) return "Main R";
+    if (n === 3) return "Main C/Mono";
+    if (n >= 4 && n <= 19) return `MX ${n - 3}`;
+    if (n >= 20 && n <= 25) return `MTX ${n - 19}`;
+    if (n >= 26 && n <= 57) return `Ch ${String(n - 25).padStart(2, "0")}`;
+    if (n >= 58 && n <= 65) return `AuxIn ${n - 57}`;
+    if (n >= 66 && n <= 73) return `FX ${Math.floor((n - 66) / 2) + 1}${n % 2 === 0 ? "L" : "R"}`;
+    return `UNKNOWN(${n})`;
+}
+
 type RawReply = { address: string; args: any[]; raw: string };
 
 export class OSCClient {
@@ -505,6 +526,394 @@ export class OSCClient {
     /** Total number of canonical node entries in the schema. */
     nodeSchemaCount(): number {
         return NODE_SCHEMA.length;
+    }
+
+    // ========== Composite signal-flow diagnostics (Phase B) ==========
+
+    /**
+     * Walk the signal path for a single channel: physical input → headamp → channel
+     * strip → DCA/mute group memberships → bus sends → main/mono → physical outputs
+     * tapped from this channel. Defensive: a partial result is preferable to a throw.
+     */
+    async traceSignal(channel: number): Promise<any> {
+        if (channel < 1 || channel > 32) throw new Error(`channel out of range: ${channel}`);
+        const nn = String(channel).padStart(2, "0");
+        const channelTapSrc = 25 + channel; // outputs.src code for "Ch NN" tap
+
+        const tryNode = async (path: string) => {
+            try { return await this.nodeRead(path); } catch { return null; }
+        };
+
+        // ----- Strip + headamp -----
+        const config = await tryNode(`ch/${nn}/config`);
+        const mix = await tryNode(`ch/${nn}/mix`);
+        const grp = await tryNode(`ch/${nn}/grp`);
+        const preamp = await tryNode(`ch/${nn}/preamp`);
+
+        const sourceField = config && config.values[3] !== undefined ? parseInt(config.values[3], 10) : null;
+        let headamp: any = null;
+        if (sourceField !== null && Number.isFinite(sourceField) && sourceField >= 0 && sourceField < 64) {
+            const ha = await tryNode(`headamp/${String(sourceField).padStart(3, "0")}`);
+            if (ha) {
+                headamp = {
+                    slot: `headamp/${String(sourceField).padStart(3, "0")}`,
+                    gain: ha.values[0] !== undefined ? parseX32Db(ha.values[0]) : null,
+                    phantom: ha.values[1] !== undefined ? parseX32Bool(ha.values[1]) : null,
+                };
+            }
+        }
+
+        const stripOn = mix && mix.values[0] !== undefined ? parseX32Bool(mix.values[0]) : null;
+        const fader = mix && mix.values[1] !== undefined ? parseX32Db(mix.values[1]) : null;
+        const stSend = mix && mix.values[2] !== undefined ? parseX32Bool(mix.values[2]) : null;
+        const monoSend = mix && mix.values[4] !== undefined ? parseX32Bool(mix.values[4]) : null;
+        const mlevel = mix && mix.values[5] !== undefined ? parseX32Db(mix.values[5]) : null;
+
+        const dcaMask = grp && grp.values[0] !== undefined ? parseX32Bitmask(grp.values[0]) : 0;
+        const muteMask = grp && grp.values[1] !== undefined ? parseX32Bitmask(grp.values[1]) : 0;
+        const dcaIndices: number[] = [];
+        for (let i = 0; i < 8; i++) if ((dcaMask >> i) & 1) dcaIndices.push(i + 1);
+        const muteGroupIndices: number[] = [];
+        for (let i = 0; i < 6; i++) if ((muteMask >> i) & 1) muteGroupIndices.push(i + 1);
+
+        // ----- DCA assignments (resolve names + state) -----
+        const dcas: any[] = [];
+        for (const i of dcaIndices) {
+            const d = await tryNode(`dca/${i}`);
+            const dc = await tryNode(`dca/${i}/config`);
+            dcas.push({
+                dca: i,
+                name: dc?.values[0] ?? null,
+                on: d?.values[0] !== undefined ? parseX32Bool(d.values[0]) : null,
+                fader: d?.values[1] !== undefined ? parseX32Db(d.values[1]) : null,
+            });
+        }
+
+        // ----- Mute groups (resolve master state) -----
+        const muteGroups: any[] = [];
+        if (muteGroupIndices.length > 0) {
+            const mute = await tryNode("config/mute");
+            for (const i of muteGroupIndices) {
+                const v = mute?.values[i - 1];
+                muteGroups.push({
+                    group: i,
+                    muted: v !== undefined ? parseX32Bool(v) : null,
+                });
+            }
+        }
+
+        // ----- Bus sends (16) — only those with level > -90 dB or on=true -----
+        const busSends: any[] = [];
+        for (let b = 1; b <= 16; b++) {
+            const bb = String(b).padStart(2, "0");
+            const send = await tryNode(`ch/${nn}/mix/${bb}`);
+            if (!send) continue;
+            const sendOn = send.values[0] !== undefined ? parseX32Bool(send.values[0]) : null;
+            const level = send.values[1] !== undefined ? parseX32Db(send.values[1]) : null;
+            const tapType = send.values[3] ?? null;
+            const isHot = sendOn === true && level !== null && level > -90;
+            if (!isHot && level !== null && level <= -90 && sendOn !== true) continue;
+            const busConfig = await tryNode(`bus/${bb}/config`);
+            const busMix = await tryNode(`bus/${bb}/mix`);
+            busSends.push({
+                bus: b,
+                name: busConfig?.values[0] ?? null,
+                sendOn,
+                level,
+                tapType,
+                hot: isHot,
+                busOn: busMix?.values[0] !== undefined ? parseX32Bool(busMix.values[0]) : null,
+                busFader: busMix?.values[1] !== undefined ? parseX32Db(busMix.values[1]) : null,
+            });
+        }
+
+        // ----- Main / mono sends -----
+        const mainStMix = await tryNode("main/st/mix");
+        const mainMMix = await tryNode("main/m/mix");
+        const mainSends = {
+            st: stSend === null ? null : {
+                send: stSend,
+                mainOn: mainStMix?.values[0] !== undefined ? parseX32Bool(mainStMix.values[0]) : null,
+                mainFader: mainStMix?.values[1] !== undefined ? parseX32Db(mainStMix.values[1]) : null,
+            },
+            mono: monoSend === null ? null : {
+                send: monoSend,
+                level: mlevel,
+                mainOn: mainMMix?.values[0] !== undefined ? parseX32Bool(mainMMix.values[0]) : null,
+                mainFader: mainMMix?.values[1] !== undefined ? parseX32Db(mainMMix.values[1]) : null,
+            },
+        };
+
+        // ----- Physical outputs tapped directly from this channel -----
+        const outputs: any[] = [];
+        const containers: Array<{ kind: string; count: number; hasInvert: boolean }> = [
+            { kind: "main", count: 16, hasInvert: true },
+            { kind: "aux", count: 6, hasInvert: true },
+            { kind: "p16", count: 16, hasInvert: true },
+            { kind: "aes", count: 2, hasInvert: true },
+            { kind: "rec", count: 2, hasInvert: false },
+        ];
+        for (const c of containers) {
+            for (let i = 1; i <= c.count; i++) {
+                const ii = String(i).padStart(2, "0");
+                const out = await tryNode(`outputs/${c.kind}/${ii}`);
+                if (!out) continue;
+                const src = out.values[0] !== undefined ? parseInt(out.values[0], 10) : null;
+                if (src !== channelTapSrc) continue;
+                outputs.push({
+                    container: `outputs/${c.kind}/${ii}`,
+                    src,
+                    srcLabel: decodeOutputTapSource(src),
+                    pos: out.values[1] ?? null,
+                    invert: c.hasInvert && out.values[2] !== undefined ? parseX32Bool(out.values[2]) : null,
+                });
+            }
+        }
+
+        // ----- Heuristic diagnostics -----
+        const warnings: string[] = [];
+        if (stripOn === false) warnings.push("channel mute is ON (signal blocked)");
+        if (fader !== null && fader <= -90) warnings.push("channel fader at -∞ (no level)");
+        if (headamp && headamp.gain !== null && headamp.gain <= -12 && stripOn === true) {
+            warnings.push(`headamp gain ${headamp.gain} dB is very low — check input level`);
+        }
+        for (const m of muteGroups) {
+            if (m.muted === true) warnings.push(`mute group ${m.group} is active`);
+        }
+        for (const d of dcas) {
+            if (d.on === false) warnings.push(`DCA ${d.dca} (${d.name}) muted`);
+            if (d.fader !== null && d.fader <= -90) warnings.push(`DCA ${d.dca} (${d.name}) at -∞`);
+        }
+        const hotBuses = busSends.filter((s) => s.hot);
+        const reachesAnything = (mainSends.st && mainSends.st.send) || (mainSends.mono && mainSends.mono.send) || hotBuses.length > 0 || outputs.length > 0;
+        if (!reachesAnything && stripOn === true) warnings.push("channel unmuted but routed nowhere (no main, no bus sends, no direct outputs)");
+
+        return {
+            channel,
+            name: config?.values[0] ?? null,
+            color: config?.values[2] ?? null,
+            input: {
+                sourceField,
+                headamp,
+            },
+            strip: {
+                on: stripOn,
+                fader,
+                preamp: preamp ? {
+                    trim: preamp.values[0] !== undefined ? parseX32Db(preamp.values[0]) : null,
+                    polarityInvert: preamp.values[1] !== undefined ? parseX32Bool(preamp.values[1]) : null,
+                    hpOn: preamp.values[2] !== undefined ? parseX32Bool(preamp.values[2]) : null,
+                    hpSlope: preamp.values[3] ?? null,
+                    hpf: preamp.values[4] !== undefined ? parseX32Freq(preamp.values[4]) : null,
+                } : null,
+                dcaMembers: dcaIndices,
+                muteGroups: muteGroupIndices,
+            },
+            dcas,
+            muteGroups,
+            busSends,
+            mainSends,
+            outputs,
+            warnings,
+        };
+    }
+
+    /**
+     * Reverse-lookup: which strips/buses currently feed `dest`?
+     * Accepts: "MIX 1" / "BUS 7" / "MTX 2" / "MAIN" / "MAIN LR" / "MONO" / "OUT 5"
+     *          "P16 3" / "AES 1" / "REC 1" / "FX 2" / "DCA 1".
+     * Returns a list of contributors with the relevant level/state.
+     */
+    async findRouting(dest: string): Promise<any> {
+        const norm = dest.trim().toUpperCase().replace(/\s+/g, " ");
+
+        const tryNode = async (path: string) => {
+            try { return await this.nodeRead(path); } catch { return null; }
+        };
+
+        // Helper to scan a strip type for a given mix/BB send -> bus N.
+        // "Currently feeding" = sendOn=true AND level>-90 dB (per Phase B spec).
+        const scanSendsToBus = async (busIdx: number) => {
+            const bb = String(busIdx).padStart(2, "0");
+            const contributors: any[] = [];
+            const stripKinds: Array<{ prefix: string; count: number; pad: number }> = [
+                { prefix: "ch", count: 32, pad: 2 },
+                { prefix: "auxin", count: 8, pad: 2 },
+                { prefix: "fxrtn", count: 8, pad: 2 },
+            ];
+            for (const k of stripKinds) {
+                for (let i = 1; i <= k.count; i++) {
+                    const ii = String(i).padStart(k.pad, "0");
+                    const send = await tryNode(`${k.prefix}/${ii}/mix/${bb}`);
+                    if (!send) continue;
+                    const sendOn = send.values[0] !== undefined ? parseX32Bool(send.values[0]) : null;
+                    const level = send.values[1] !== undefined ? parseX32Db(send.values[1]) : null;
+                    if (sendOn !== true) continue;
+                    if (level === null || level <= -90) continue;
+                    const cfg = await tryNode(`${k.prefix}/${ii}/config`);
+                    contributors.push({
+                        strip: `${k.prefix}/${ii}`,
+                        name: cfg?.values[0] ?? null,
+                        sendOn,
+                        level,
+                        tapType: send.values[3] ?? null,
+                    });
+                }
+            }
+            return contributors;
+        };
+
+        // Helper to scan strips for main LR or main mono via the mix node.
+        const scanMain = async (which: "st" | "mono") => {
+            const contributors: any[] = [];
+            const stripKinds: Array<{ prefix: string; count: number; pad: number }> = [
+                { prefix: "ch", count: 32, pad: 2 },
+                { prefix: "auxin", count: 8, pad: 2 },
+                { prefix: "fxrtn", count: 8, pad: 2 },
+                { prefix: "bus", count: 16, pad: 2 },
+            ];
+            for (const k of stripKinds) {
+                for (let i = 1; i <= k.count; i++) {
+                    const ii = String(i).padStart(k.pad, "0");
+                    const m = await tryNode(`${k.prefix}/${ii}/mix`);
+                    if (!m) continue;
+                    const stripOn = m.values[0] !== undefined ? parseX32Bool(m.values[0]) : null;
+                    const fader = m.values[1] !== undefined ? parseX32Db(m.values[1]) : null;
+                    const enable = which === "st"
+                        ? (m.values[2] !== undefined ? parseX32Bool(m.values[2]) : null)
+                        : (m.values[4] !== undefined ? parseX32Bool(m.values[4]) : null);
+                    if (enable !== true) continue;
+                    if (stripOn !== true) continue;
+                    if (fader !== null && fader <= -90) continue;
+                    const cfg = await tryNode(`${k.prefix}/${ii}/config`);
+                    contributors.push({
+                        strip: `${k.prefix}/${ii}`,
+                        name: cfg?.values[0] ?? null,
+                        stripOn,
+                        fader,
+                        sendEnabled: enable,
+                    });
+                }
+            }
+            return contributors;
+        };
+
+        // ----- Dispatch -----
+        let m: RegExpMatchArray | null;
+
+        m = norm.match(/^(?:MIX|BUS)\s*(\d+)$/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n < 1 || n > 16) throw new Error(`bus out of range: ${n}`);
+            const contributors = await scanSendsToBus(n);
+            return { dest: `MIX ${n}`, kind: "bus", contributors };
+        }
+
+        m = norm.match(/^(?:MTX|MATRIX)\s*(\d+)$/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n < 1 || n > 6) throw new Error(`matrix out of range: ${n}`);
+            const nn = String(n).padStart(2, "0");
+            const contributors: any[] = [];
+            for (let b = 1; b <= 16; b++) {
+                const bb = String(b).padStart(2, "0");
+                const send = await tryNode(`bus/${bb}/mix/${nn}`);
+                if (!send) continue;
+                const sendOn = send.values[0] !== undefined ? parseX32Bool(send.values[0]) : null;
+                const level = send.values[1] !== undefined ? parseX32Db(send.values[1]) : null;
+                if (sendOn !== true) continue;
+                if (level === null || level <= -90) continue;
+                const cfg = await tryNode(`bus/${bb}/config`);
+                contributors.push({ strip: `bus/${bb}`, name: cfg?.values[0] ?? null, sendOn, level, tapType: send.values[3] ?? null });
+            }
+            // main/st can also send to matrix
+            const stMain = await tryNode(`main/st/mix/${nn}`);
+            if (stMain) {
+                const sendOn = stMain.values[0] !== undefined ? parseX32Bool(stMain.values[0]) : null;
+                const level = stMain.values[1] !== undefined ? parseX32Db(stMain.values[1]) : null;
+                if (sendOn === true && level !== null && level > -90) {
+                    contributors.push({ strip: "main/st", name: "Main LR", sendOn, level, tapType: stMain.values[3] ?? null });
+                }
+            }
+            return { dest: `MTX ${n}`, kind: "matrix", contributors };
+        }
+
+        if (norm === "MAIN" || norm === "MAIN LR" || norm === "LR") {
+            const contributors = await scanMain("st");
+            return { dest: "MAIN LR", kind: "main", contributors };
+        }
+        if (norm === "MONO" || norm === "MAIN M" || norm === "MAIN MONO" || norm === "M/C" || norm === "C") {
+            const contributors = await scanMain("mono");
+            return { dest: "MAIN MONO", kind: "main", contributors };
+        }
+
+        m = norm.match(/^(OUT|OUTPUT|P16|AUX OUT|AUX|AES|REC)\s*(\d+)$/);
+        if (m) {
+            const kindWord = m[1];
+            const n = parseInt(m[2], 10);
+            const map: Record<string, string> = {
+                OUT: "main", OUTPUT: "main", P16: "p16", "AUX OUT": "aux", AUX: "aux", AES: "aes", REC: "rec",
+            };
+            const kind = map[kindWord];
+            const ii = String(n).padStart(2, "0");
+            const out = await tryNode(`outputs/${kind}/${ii}`);
+            if (!out) return { dest: norm, kind: "output", contributors: [], note: "node read failed" };
+            const src = out.values[0] !== undefined ? parseInt(out.values[0], 10) : null;
+            return {
+                dest: norm,
+                kind: "output",
+                container: `outputs/${kind}/${ii}`,
+                src,
+                srcLabel: src === null ? null : decodeOutputTapSource(src),
+                pos: out.values[1] ?? null,
+                invert: out.values[2] !== undefined ? parseX32Bool(out.values[2]) : null,
+            };
+        }
+
+        m = norm.match(/^FX\s*(\d+)$/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n < 1 || n > 8) throw new Error(`fx slot out of range: ${n}`);
+            const src = await tryNode(`fx/${n}/source`);
+            return {
+                dest: `FX ${n}`,
+                kind: "fx",
+                sourceL: src?.values[0] ?? null,
+                sourceR: src?.values[1] ?? null,
+                contributors: src ? [
+                    { name: `sourceL=${src.values[0]}` },
+                    { name: `sourceR=${src.values[1]}` },
+                ] : [],
+            };
+        }
+
+        m = norm.match(/^DCA\s*(\d+)$/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n < 1 || n > 8) throw new Error(`dca out of range: ${n}`);
+            const bit = 1 << (n - 1);
+            const contributors: any[] = [];
+            const stripKinds: Array<{ prefix: string; count: number }> = [
+                { prefix: "ch", count: 32 },
+                { prefix: "auxin", count: 8 },
+                { prefix: "fxrtn", count: 8 },
+                { prefix: "bus", count: 16 },
+            ];
+            for (const k of stripKinds) {
+                for (let i = 1; i <= k.count; i++) {
+                    const ii = String(i).padStart(2, "0");
+                    const grp = await tryNode(`${k.prefix}/${ii}/grp`);
+                    if (!grp) continue;
+                    const mask = grp.values[0] !== undefined ? parseX32Bitmask(grp.values[0]) : 0;
+                    if ((mask & bit) === 0) continue;
+                    const cfg = await tryNode(`${k.prefix}/${ii}/config`);
+                    contributors.push({ strip: `${k.prefix}/${ii}`, name: cfg?.values[0] ?? null });
+                }
+            }
+            return { dest: `DCA ${n}`, kind: "dca", contributors };
+        }
+
+        throw new Error(`Unknown destination "${dest}". Try MIX N, MTX N, MAIN, MONO, OUT N, P16 N, AUX N, AES N, REC N, FX N, DCA N.`);
     }
 
     /**

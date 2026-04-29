@@ -833,6 +833,39 @@ const TOOLS: Tool[] = [
             required: ["path", "fields"],
         },
     },
+    // ========== Composite signal-flow diagnostics (Phase B) ==========
+    {
+        name: "osc_trace_signal",
+        description:
+            "Trace the full signal path for a channel: physical input → headamp → strip state → DCA/mute groups → bus sends → main/mono → physical outputs tapped from this channel. Returns a structured tree plus heuristic warnings (\"channel muted\", \"DCA at -∞\", \"routed nowhere\"). Use for \"why isn't channel X working\" diagnostics.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                channel: {
+                    type: "number",
+                    description: "Channel number (1-32)",
+                    minimum: 1,
+                    maximum: 32,
+                },
+            },
+            required: ["channel"],
+        },
+    },
+    {
+        name: "osc_find_routing",
+        description:
+            "Reverse-lookup what currently feeds a destination. Accepts \"MIX 1\", \"BUS 7\", \"MTX 2\", \"MAIN\", \"MONO\", \"OUT 5\", \"P16 3\", \"AES 1\", \"REC 1\", \"FX 2\", \"DCA 1\". Returns the list of contributing strips with on/level/tap-type, filtering out those that are off or at -∞. Use for \"what's coming out of OUT 5\" / \"what feeds MIX 1\" questions.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                dest: {
+                    type: "string",
+                    description: "Destination label, e.g. \"MIX 1\", \"MTX 2\", \"MAIN\", \"OUT 5\", \"P16 3\", \"FX 2\", \"DCA 1\".",
+                },
+            },
+            required: ["dest"],
+        },
+    },
 ];
 
 // Create MCP server
@@ -1667,6 +1700,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Wrote ${wrote.length} field(s) on ${nodePath}: ${wrote.join(", ")}\n  encoded payload: ${JSON.stringify(sent)}`,
+                    }],
+                };
+            }
+
+            case "osc_trace_signal": {
+                const { channel } = args as { channel: number };
+                const trace = await osc.traceSignal(channel);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Signal trace for ch ${channel}:\n${JSON.stringify(trace, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_find_routing": {
+                const { dest } = args as { dest: string };
+                const result = await osc.findRouting(dest);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Routing into ${dest}:\n${JSON.stringify(result, null, 2)}`,
                     }],
                 };
             }
