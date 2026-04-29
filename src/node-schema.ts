@@ -527,6 +527,16 @@ export const NODE_SCHEMA: NodeSchemaEntry[] = [
         ],
     },
 
+    // ========== FX source (slots 1..4 only — slots 5..8 are channel inserts) ==========
+    {
+        path: "fx/[1..4]/source",
+        description: "FX slot 1..4 stereo source — sourceL / sourceR. Values are bus name strings like 'MIX13' or 'OFF'.",
+        fields: [
+            { name: "sourceL", type: "string" },
+            { name: "sourceR", type: "string" },
+        ],
+    },
+
     // ========== Physical output containers ==========
     // src field is the X32 output-tap source enum (different from User Out enum):
     //   0=OFF; 1=MainL; 2=MainR; 3=MainC; 4..19=MX1..16; 20..25=MTX1..6;
@@ -614,6 +624,16 @@ export const NODE_SCHEMA: NodeSchemaEntry[] = [
             name: `link${i * 2 + 1}_${i * 2 + 2}`,
             type: "bool" as FieldType,
         })),
+    },
+    {
+        path: "config/linkcfg",
+        description: "Link behavior flags — which strip sections follow the channel/bus link toggle",
+        fields: [
+            { name: "eq", type: "bool", note: "EQ tracks across linked pair" },
+            { name: "dyn", type: "bool", note: "dynamics tracks" },
+            { name: "fdrmute", type: "bool", note: "fader/mute tracks" },
+            { name: "group", type: "bool", note: "DCA / mute group membership tracks" },
+        ],
     },
 ];
 

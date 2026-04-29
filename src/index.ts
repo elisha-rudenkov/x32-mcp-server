@@ -866,6 +866,31 @@ const TOOLS: Tool[] = [
             required: ["dest"],
         },
     },
+    // ========== Scene snapshot + audit (Phase C) ==========
+    {
+        name: "osc_scene_snapshot",
+        description:
+            "Walk every top-level /node container and return one structured object: meta (firmware, name, ip), channels[32], auxins[8], fxrtns[8], buses[16], matrices[6], main, dcas[8], fx[8], outputs (main/aux/p16/aes/rec), routing (legacy + user_in + user_out), config (mute/chlink/buslink/auxlink/mtxlink/linkcfg). Schema-decoded — values come back as native JS types (dB numbers, freq Hz, enum strings, bools). Defensive: partial dump survives if some nodes timeout. ~2-5s wall time on a live mixer. Skips meters, scene/show files, talkback, monitor, prefs.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "osc_scene_audit",
+        description:
+            "Run deterministic heuristics over a scene snapshot and return a list of findings tagged info|warn|error. Catches: low headamp gain on hot channels, vocal phantom-off, EQ feedback risks, aggressive compression, gates that won't trigger, send-to-muted-bus, output-from-muted-bus, linked-pair drift, FX returns muted while sourced, orphan buses, mute-group-active, and duplicate output taps with different positions. Pass `snapshot` to reuse a prior osc_scene_snapshot result; omit it to fetch a fresh one. Findings sort error > warn > info, then by path. The LLM wraps these into prose for the volunteer.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                snapshot: {
+                    type: "object",
+                    description: "Optional prior osc_scene_snapshot result. Pass to avoid re-walking the mixer.",
+                    additionalProperties: true,
+                },
+            },
+        },
+    },
 ];
 
 // Create MCP server
@@ -1722,6 +1747,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Routing into ${dest}:\n${JSON.stringify(result, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_scene_snapshot": {
+                const snap = await osc.sceneSnapshot();
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Scene snapshot (captured ${snap.meta.captured_at}, ${snap.meta.wall_ms}ms):\n${JSON.stringify(snap, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_scene_audit": {
+                const { snapshot } = args as { snapshot?: any };
+                const result = await osc.sceneAudit(snapshot);
+                const counts = result.findings.reduce((m: Record<string, number>, f: any) => {
+                    m[f.severity] = (m[f.severity] || 0) + 1;
+                    return m;
+                }, {});
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Scene audit (${result.findings.length} findings — ${JSON.stringify(counts)}):\n${JSON.stringify(result, null, 2)}`,
                     }],
                 };
             }

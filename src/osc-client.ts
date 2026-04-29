@@ -1971,6 +1971,569 @@ export class OSCClient {
         this.sendCommand(address, packed);
     }
 
+    // ========== Scene snapshot + audit (Phase C) ==========
+
+    /**
+     * Walk every top-level /node container the schema covers and return one
+     * structured object the LLM can reason about. Schema-driven decoding so
+     * values arrive as native types (db numbers, freq Hz, enum strings, bools).
+     *
+     * Defensive: every read is wrapped in try/catch — a partial dump survives
+     * even if some nodes timeout or are unassigned (e.g., headamp slots on
+     * channels routed via User In rather than local headamps).
+     *
+     * Skips meters, scene/show files, talkback, monitor, prefs (Phase G skip
+     * list). FX params are omitted — Phase D′ surfaces those by algorithm.
+     */
+    async sceneSnapshot(): Promise<any> {
+        const t0 = Date.now();
+
+        const tryGet = async (p: string): Promise<any> => {
+            try { return await this.nodeGetField(p); } catch { return null; }
+        };
+        const trySafeRead = async (addr: string): Promise<any> => {
+            try { return await this.sendAndReceive(addr); } catch { return null; }
+        };
+
+        // ----- META -----
+        let identity: any = null;
+        try { identity = await this.getIdentity(); } catch { /* keep going */ }
+
+        // ----- CHANNELS (32) -----
+        const channels = await Promise.all(Array.from({ length: 32 }, async (_, i) => {
+            const n = i + 1;
+            const nn = String(n).padStart(2, "0");
+            const config = await tryGet(`ch/${nn}/config`);
+            const mix = await tryGet(`ch/${nn}/mix`);
+            const eq = await tryGet(`ch/${nn}/eq`);
+            const eqBands: any[] = [];
+            for (let b = 1; b <= 4; b++) eqBands.push(await tryGet(`ch/${nn}/eq/${b}`));
+            const gate = await tryGet(`ch/${nn}/gate`);
+            const dyn = await tryGet(`ch/${nn}/dyn`);
+            const preamp = await tryGet(`ch/${nn}/preamp`);
+            const grp = await tryGet(`ch/${nn}/grp`);
+            const sends: any[] = [];
+            for (let b = 1; b <= 16; b++) {
+                const bb = String(b).padStart(2, "0");
+                const s = await tryGet(`ch/${nn}/mix/${bb}`);
+                sends.push(s ? { bus: b, ...s } : { bus: b, on: null, level: null });
+            }
+            let headamp: any = null;
+            const src = config?.source;
+            if (typeof src === "number" && src >= 0 && src < 64) {
+                headamp = await tryGet(`headamp/${String(src).padStart(3, "0")}`);
+            }
+            return { n, config, mix, eq, eqBands, gate, dyn, preamp, grp, headamp, sends };
+        }));
+
+        // ----- AUX INPUTS (8) -----
+        // auxin/N/automix is NOT a valid /node container on firmware 4.13 (verified
+        // via probe: it times out). Skip it — schema entry kept only for write paths
+        // that may resolve via leaves. The audit rules don't reference automix.
+        const auxins = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
+            const n = i + 1;
+            const nn = String(n).padStart(2, "0");
+            const config = await tryGet(`auxin/${nn}/config`);
+            const mix = await tryGet(`auxin/${nn}/mix`);
+            const preamp = await tryGet(`auxin/${nn}/preamp`);
+            const grp = await tryGet(`auxin/${nn}/grp`);
+            const sends: any[] = [];
+            for (let b = 1; b <= 16; b++) {
+                const bb = String(b).padStart(2, "0");
+                const s = await tryGet(`auxin/${nn}/mix/${bb}`);
+                sends.push(s ? { bus: b, ...s } : { bus: b, on: null, level: null });
+            }
+            return { n, config, mix, preamp, grp, sends };
+        }));
+
+        // ----- FX RETURNS (8) -----
+        const fxrtns = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
+            const n = i + 1;
+            const nn = String(n).padStart(2, "0");
+            const config = await tryGet(`fxrtn/${nn}/config`);
+            const mix = await tryGet(`fxrtn/${nn}/mix`);
+            const grp = await tryGet(`fxrtn/${nn}/grp`);
+            const sends: any[] = [];
+            for (let b = 1; b <= 16; b++) {
+                const bb = String(b).padStart(2, "0");
+                const s = await tryGet(`fxrtn/${nn}/mix/${bb}`);
+                sends.push(s ? { bus: b, ...s } : { bus: b, on: null, level: null });
+            }
+            return { n, config, mix, grp, sends };
+        }));
+
+        // ----- BUSES (16) — sends are to matrices (1..6) -----
+        const buses = await Promise.all(Array.from({ length: 16 }, async (_, i) => {
+            const n = i + 1;
+            const nn = String(n).padStart(2, "0");
+            const config = await tryGet(`bus/${nn}/config`);
+            const mix = await tryGet(`bus/${nn}/mix`);
+            const grp = await tryGet(`bus/${nn}/grp`);
+            const sends: any[] = [];
+            for (let m = 1; m <= 6; m++) {
+                const mm = String(m).padStart(2, "0");
+                const s = await tryGet(`bus/${nn}/mix/${mm}`);
+                sends.push(s ? { mtx: m, ...s } : { mtx: m, on: null, level: null });
+            }
+            return { n, config, mix, grp, sends };
+        }));
+
+        // ----- MATRICES (6) -----
+        const matrices = await Promise.all(Array.from({ length: 6 }, async (_, i) => {
+            const n = i + 1;
+            const nn = String(n).padStart(2, "0");
+            const config = await tryGet(`mtx/${nn}/config`);
+            const mix = await tryGet(`mtx/${nn}/mix`);
+            const grp = await tryGet(`mtx/${nn}/grp`);
+            return { n, config, mix, grp };
+        }));
+
+        // ----- MAIN (st + m) -----
+        const stConfig = await tryGet("main/st/config");
+        const stMix = await tryGet("main/st/mix");
+        const stGrp = await tryGet("main/st/grp");
+        const stSends: any[] = [];
+        for (let m = 1; m <= 6; m++) {
+            const mm = String(m).padStart(2, "0");
+            const s = await tryGet(`main/st/mix/${mm}`);
+            stSends.push(s ? { mtx: m, ...s } : { mtx: m, on: null, level: null });
+        }
+        const mConfig = await tryGet("main/m/config");
+        const mMix = await tryGet("main/m/mix");
+        const mGrp = await tryGet("main/m/grp");
+        const main = {
+            st: { config: stConfig, mix: stMix, grp: stGrp, sends: stSends },
+            m: { config: mConfig, mix: mMix, grp: mGrp },
+        };
+
+        // ----- DCAs (8) -----
+        const dcas = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
+            const n = i + 1;
+            const dca = await tryGet(`dca/${n}`);
+            const config = await tryGet(`dca/${n}/config`);
+            return { n, config, ...(dca || { on: null, fader: null }) };
+        }));
+
+        // ----- FX (8) — type leaf + source node for slots 1..4 -----
+        const fx = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
+            const n = i + 1;
+            const type = await trySafeRead(`/fx/${n}/type`);
+            const slot: any = { slot: n, type };
+            if (n <= 4) slot.source = await tryGet(`fx/${n}/source`);
+            return slot;
+        }));
+
+        // ----- OUTPUTS -----
+        const readOutputs = async (kind: string, count: number) => {
+            const list: any[] = [];
+            for (let i = 1; i <= count; i++) {
+                const ii = String(i).padStart(2, "0");
+                const o = await tryGet(`outputs/${kind}/${ii}`);
+                let srcLabel: string | null = null;
+                if (o && typeof o.src === "number") srcLabel = decodeOutputTapSource(o.src);
+                list.push({ n: i, ...(o || { src: null, pos: null, invert: null }), srcLabel });
+            }
+            return list;
+        };
+        const outputs = {
+            main: await readOutputs("main", 16),
+            aux: await readOutputs("aux", 6),
+            p16: await readOutputs("p16", 16),
+            aes: await readOutputs("aes", 2),
+            rec: await readOutputs("rec", 2),
+        };
+
+        // ----- ROUTING -----
+        // Avoid getRouting() — its /fx/5..8/source reads time out (1s each, no such
+        // address on this firmware) and waste ~4s. Read block routing directly with
+        // parallel safeReads (different addresses → osc-js can dispatch concurrently).
+        const readBlock = async (kind: string, blocks: string[]) => {
+            const out: Record<string, any> = {};
+            const vals = await Promise.all(blocks.map((b) =>
+                this.safeRead(`/config/routing/${kind}/${b}`)));
+            blocks.forEach((b, i) => {
+                const raw = vals[i];
+                out[`${kind}_${b}`] = raw === null
+                    ? { raw: null, label: null }
+                    : { raw, label: decodeBlockInSource(raw) };
+            });
+            return out;
+        };
+        const block_in = readBlock("IN", ["1-8", "9-16", "17-24", "25-32"]);
+        const block_aes50a = readBlock("AES50A", ["1-8", "9-16", "17-24", "25-32", "33-40", "41-48"]);
+        const block_aes50b = readBlock("AES50B", ["1-8", "9-16", "17-24", "25-32", "33-40", "41-48"]);
+        const block_card = readBlock("CARD", ["1-8", "9-16", "17-24", "25-32"]);
+
+        const userIn = Promise.all(Array.from({ length: 32 }, async (_, i) => {
+            const slot = i + 1;
+            const source = await this.safeRead(`/config/userrout/in/${String(slot).padStart(2, "0")}`);
+            return { slot, source, sourceLabel: source === null ? null : decodeUserInSource(source) };
+        }));
+        const userOut = Promise.all(Array.from({ length: 48 }, async (_, i) => {
+            const slot = i + 1;
+            const source = await this.safeRead(`/config/userrout/out/${String(slot).padStart(2, "0")}`);
+            return { slot, source, sourceLabel: source === null ? null : decodeUserOutSource(source) };
+        }));
+
+        const [
+            blockInResolved, blockAes50aResolved, blockAes50bResolved, blockCardResolved,
+            user_in, user_out,
+        ] = await Promise.all([block_in, block_aes50a, block_aes50b, block_card, userIn, userOut]);
+
+        const routing = {
+            block_in: blockInResolved,
+            block_aes50a: blockAes50aResolved,
+            block_aes50b: blockAes50bResolved,
+            block_card: blockCardResolved,
+            user_in, user_out,
+        };
+
+        // ----- CONFIG -----
+        const config = {
+            mute: await tryGet("config/mute"),
+            chlink: await tryGet("config/chlink"),
+            buslink: await tryGet("config/buslink"),
+            auxlink: await tryGet("config/auxlink"),
+            mtxlink: await tryGet("config/mtxlink"),
+            linkcfg: await tryGet("config/linkcfg"),
+        };
+
+        const wall_ms = Date.now() - t0;
+        return {
+            meta: {
+                model: identity?.model ?? null,
+                firmware: identity?.firmware ?? null,
+                ip: identity?.ip ?? null,
+                name: identity?.name ?? null,
+                state: identity?.state ?? null,
+                captured_at: new Date().toISOString(),
+                wall_ms,
+            },
+            channels, auxins, fxrtns, buses, matrices, main, dcas, fx, outputs, routing, config,
+        };
+    }
+
+    /**
+     * Run deterministic heuristics over a scene snapshot. If `snap` is omitted
+     * the snapshot is fetched first. Returns a list of findings sorted by
+     * severity (error > warn > info) then by path.
+     *
+     * Findings are structured, not pretty-printed — the LLM wraps them into
+     * prose for the volunteer.
+     */
+    async sceneAudit(snap?: any): Promise<{ findings: any[]; snapshotMeta: any }> {
+        const s = snap ?? await this.sceneSnapshot();
+        const findings: any[] = [];
+        const add = (severity: "info" | "warn" | "error", path: string, rule: string, message: string) => {
+            findings.push({ severity, path, rule, message });
+        };
+
+        const isVocalName = (name?: string | null): boolean => {
+            if (!name) return false;
+            return /^vo[cx]/i.test(name.trim());
+        };
+
+        // ----- per-channel checks -----
+        for (const c of (s.channels || [])) {
+            const tag = `ch/${String(c.n).padStart(2, "0")}`;
+            const name = c.config?.name ?? null;
+            const onMix = c.mix?.on === true;
+            const fader: number = typeof c.mix?.fader === "number" ? c.mix.fader : -Infinity;
+            const haGain: number | null = typeof c.headamp?.gain === "number" ? c.headamp.gain : null;
+            const phantom: boolean | null = typeof c.headamp?.phantom === "boolean" ? c.headamp.phantom : null;
+
+            // SIGNAL-PATH: unmuted + fader > -90 + headamp gain <= -12 dB
+            if (onMix && fader > -90 && haGain !== null && haGain <= -12) {
+                add("warn", tag, "low-headamp-gain",
+                    `${name || tag} unmuted with fader ${fader.toFixed(1)}dB but headamp gain is ${haGain.toFixed(1)}dB — likely no signal at the input.`);
+            }
+
+            // SIGNAL-PATH: phantom power off on a vocal-named channel
+            if (isVocalName(name) && phantom === false) {
+                add("info", tag, "vocal-phantom-off",
+                    `${name} (likely vocal) has phantom power OFF — most condenser mics need +48V.`);
+            }
+
+            // SIGNAL-PATH: unreachable — unmuted, fader up, but no DCA, no main, no bus sends
+            const dcaMask = typeof c.grp?.dca === "number" ? c.grp.dca : 0;
+            const muteMask = typeof c.grp?.mute === "number" ? c.grp.mute : 0;
+            const stSend = c.mix?.st === true;
+            const monoSend = c.mix?.mono === true;
+            const hotBusSends = (c.sends || []).filter((x: any) =>
+                x.on === true && typeof x.level === "number" && x.level > -90);
+            if (onMix && fader > -90 && dcaMask === 0 && !stSend && !monoSend && hotBusSends.length === 0) {
+                add("warn", tag, "unreachable",
+                    `${name || tag} is unmuted with fader up but routed nowhere — no main send, no bus sends, no DCA.`);
+            }
+
+            // SIGNAL-PATH: send-to-muted-bus / send-to-silent-bus is consolidated
+            // below at the per-bus level — one finding per silent bus, listing
+            // the hot-feeding strips. Issuing one per send produced 80+ findings
+            // on a typical scene with several inactive monitor buses.
+
+            // EQ: feedback risk
+            const eqOn = c.eq?.on === true;
+            if (eqOn) {
+                for (let b = 0; b < (c.eqBands || []).length; b++) {
+                    const band = c.eqBands[b];
+                    if (!band) continue;
+                    const g: number | null = typeof band.g === "number" ? band.g : null;
+                    const f: number | null = typeof band.f === "number" ? band.f : null;
+                    if (g === null || f === null) continue;
+                    if (g > 9 && f < 80) {
+                        add("warn", `${tag}/eq/${b + 1}`, "subwoofer-feedback-risk",
+                            `${name || tag} EQ band ${b + 1}: +${g.toFixed(1)}dB at ${f.toFixed(0)}Hz — likely subwoofer feedback or rumble boost.`);
+                    } else if (g > 9 && f < 200) {
+                        add("warn", `${tag}/eq/${b + 1}`, "low-mid-feedback-risk",
+                            `${name || tag} EQ band ${b + 1}: +${g.toFixed(1)}dB at ${f.toFixed(0)}Hz — feedback / boominess risk.`);
+                    }
+                }
+            }
+
+            // GATE: high threshold on vocal
+            const gateOn = c.gate?.on === true;
+            const gateThr: number | null = typeof c.gate?.thr === "number" ? c.gate.thr : null;
+            const gateRange: number | null = typeof c.gate?.range === "number" ? c.gate.range : null;
+            if (gateOn && gateThr !== null && gateThr > -20 && isVocalName(name)) {
+                add("info", `${tag}/gate`, "vocal-gate-high",
+                    `${name} gate threshold is ${gateThr.toFixed(1)}dB — soft phrases may get cut. Try -30dB or lower for spoken/sung vocals.`);
+            }
+            if (gateOn && gateRange !== null && gateRange < 10) {
+                add("info", `${tag}/gate`, "gate-range-narrow",
+                    `${name || tag} gate range is only ${gateRange.toFixed(1)}dB — gate is barely doing anything.`);
+            }
+
+            // DYN: very aggressive compression
+            const dynOn = c.dyn?.on === true;
+            const dynThr: number | null = typeof c.dyn?.thr === "number" ? c.dyn.thr : null;
+            const dynRatio: number | null = typeof c.dyn?.ratio === "number" ? c.dyn.ratio : null;
+            if (dynOn && dynRatio !== null && dynThr !== null && dynRatio > 8 && dynThr > -20) {
+                add("info", `${tag}/dyn`, "aggressive-compression",
+                    `${name || tag} compressor is aggressive: ${dynRatio.toFixed(1)}:1 ratio at ${dynThr.toFixed(1)}dB threshold — sounds heavily limited.`);
+            }
+        }
+
+        // ----- LINKED CHANNEL DIVERGENCE -----
+        // chlink has 16 booleans; index i=0 means pair (1,2), i=1 means pair (3,4), etc.
+        const chlink = s.config?.chlink || {};
+        const linkArr = Object.values(chlink) as boolean[];
+        for (let i = 0; i < linkArr.length; i++) {
+            if (linkArr[i] !== true) continue;
+            const a = (s.channels || [])[i * 2];
+            const b = (s.channels || [])[i * 2 + 1];
+            if (!a || !b) continue;
+            const tag = `ch/${String(a.n).padStart(2, "0")}+${String(b.n).padStart(2, "0")}`;
+            const diffs: string[] = [];
+            const af = a.mix?.fader, bf = b.mix?.fader;
+            if (typeof af === "number" && typeof bf === "number" && Math.abs(af - bf) > 0.5) {
+                diffs.push(`fader ${af.toFixed(1)} vs ${bf.toFixed(1)} dB`);
+            }
+            const aGate = a.gate, bGate = b.gate;
+            if (aGate && bGate && (aGate.on !== bGate.on || aGate.thr !== bGate.thr)) {
+                diffs.push(`gate on=${aGate.on}/${bGate.on} thr=${aGate.thr}/${bGate.thr}`);
+            }
+            const aDyn = a.dyn, bDyn = b.dyn;
+            if (aDyn && bDyn && (aDyn.on !== bDyn.on || aDyn.thr !== bDyn.thr || aDyn.ratio !== bDyn.ratio)) {
+                diffs.push(`dyn on=${aDyn.on}/${bDyn.on}`);
+            }
+            for (let bi = 0; bi < 4; bi++) {
+                const ab = (a.eqBands || [])[bi], bb = (b.eqBands || [])[bi];
+                if (ab && bb && (ab.g !== bb.g || ab.f !== bb.f || ab.q !== bb.q || ab.type !== bb.type)) {
+                    diffs.push(`eq band ${bi + 1} differs`);
+                }
+            }
+            if (diffs.length > 0) {
+                add("warn", tag, "linked-pair-diverged",
+                    `Linked pair ch${a.n}/${b.n} has differing settings: ${diffs.join("; ")}.`);
+            }
+        }
+
+        // ----- FX RETURN MUTED BUT SOURCE ASSIGNED -----
+        for (const slot of (s.fx || [])) {
+            if (slot.slot > 4) continue;  // 5-8 are inserts, no source/return pair
+            const fxr = (s.fxrtns || [])[slot.slot - 1];
+            if (!fxr) continue;
+            const sourceL = slot.source?.sourceL ?? null;
+            const sourceR = slot.source?.sourceR ?? null;
+            const assigned = (sourceL && sourceL !== "OFF") || (sourceR && sourceR !== "OFF");
+            const fxrOn = fxr.mix?.on === true;
+            if (assigned && !fxrOn) {
+                add("warn", `fxrtn/${String(slot.slot).padStart(2, "0")}`, "fx-muted-but-sourced",
+                    `FX slot ${slot.slot} is sourced (${sourceL}/${sourceR}) but FX return ${slot.slot} is muted — no FX in the mix.`);
+            }
+        }
+
+        // ----- OUTPUT TAPS A MUTED BUS -----
+        // Output src enum: 4..19 = MX1..MX16 (bus = src - 3)
+        const checkOutputs = (kind: string, list: any[]) => {
+            for (const o of (list || [])) {
+                if (typeof o.src !== "number") continue;
+                if (o.src >= 4 && o.src <= 19) {
+                    const busN = o.src - 3;
+                    const bus = (s.buses || [])[busN - 1];
+                    if (!bus) continue;
+                    const busOn = bus.mix?.on === true;
+                    if (!busOn) {
+                        add("error", `outputs/${kind}/${String(o.n).padStart(2, "0")}`, "output-from-muted-bus",
+                            `${kind.toUpperCase()} ${o.n} is sourced from MIX${busN} (${bus.config?.name || "?"}) but that bus is MUTED — output carries silence.`);
+                    }
+                }
+            }
+        };
+        checkOutputs("main", s.outputs?.main || []);
+        checkOutputs("aux", s.outputs?.aux || []);
+        checkOutputs("p16", s.outputs?.p16 || []);
+        checkOutputs("aes", s.outputs?.aes || []);
+        checkOutputs("rec", s.outputs?.rec || []);
+
+        // ----- TWO OUTPUTS TAPPING SAME CHANNEL AT DIFFERENT POSITIONS -----
+        const channelTaps = new Map<number, Array<{ container: string; pos: any }>>();
+        const collectChTap = (kind: string, list: any[]) => {
+            for (const o of (list || [])) {
+                if (typeof o.src !== "number") continue;
+                // src 26..57 = Ch01..Ch32
+                if (o.src >= 26 && o.src <= 57) {
+                    const ch = o.src - 25;
+                    if (!channelTaps.has(ch)) channelTaps.set(ch, []);
+                    channelTaps.get(ch)!.push({
+                        container: `outputs/${kind}/${String(o.n).padStart(2, "0")}`,
+                        pos: o.pos ?? null,
+                    });
+                }
+            }
+        };
+        collectChTap("main", s.outputs?.main || []);
+        collectChTap("aux", s.outputs?.aux || []);
+        collectChTap("p16", s.outputs?.p16 || []);
+        collectChTap("aes", s.outputs?.aes || []);
+        collectChTap("rec", s.outputs?.rec || []);
+        for (const [ch, taps] of channelTaps) {
+            if (taps.length < 2) continue;
+            const positions = new Set(taps.map((t) => t.pos));
+            if (positions.size > 1) {
+                add("warn", `ch/${String(ch).padStart(2, "0")}`, "duplicate-output-tap-positions",
+                    `Channel ${ch} is tapped by ${taps.length} outputs with different tap positions: ${taps.map((t) => `${t.container}@${t.pos}`).join(", ")} — likely a mistake.`);
+            }
+        }
+
+        // ----- MUTE GROUP ACTIVE -----
+        const muteCfg = s.config?.mute || {};
+        const muteFlags = Object.values(muteCfg) as boolean[];
+        for (let g = 0; g < muteFlags.length; g++) {
+            if (muteFlags[g] !== true) continue;
+            const groupBit = 1 << g;
+            const muted: string[] = [];
+            for (const c of (s.channels || [])) {
+                const m = typeof c.grp?.mute === "number" ? c.grp.mute : 0;
+                if ((m & groupBit) !== 0) muted.push(`ch${c.n}${c.config?.name ? `(${c.config.name})` : ""}`);
+            }
+            for (const a of (s.auxins || [])) {
+                const m = typeof a.grp?.mute === "number" ? a.grp.mute : 0;
+                if ((m & groupBit) !== 0) muted.push(`auxin${a.n}${a.config?.name ? `(${a.config.name})` : ""}`);
+            }
+            for (const fr of (s.fxrtns || [])) {
+                const m = typeof fr.grp?.mute === "number" ? fr.grp.mute : 0;
+                if ((m & groupBit) !== 0) muted.push(`fxrtn${fr.n}${fr.config?.name ? `(${fr.config.name})` : ""}`);
+            }
+            for (const b of (s.buses || [])) {
+                const m = typeof b.grp?.mute === "number" ? b.grp.mute : 0;
+                if ((m & groupBit) !== 0) muted.push(`bus${b.n}${b.config?.name ? `(${b.config.name})` : ""}`);
+            }
+            add("info", `config/mute`, "mute-group-active",
+                `Mute group ${g + 1} is ACTIVE — strips muted by it: ${muted.length > 0 ? muted.join(", ") : "(none assigned)"}.`);
+        }
+
+        // ----- BUS HAS HOT INPUTS BUT IS MUTED OR FADER-DOWN -----
+        for (const bus of (s.buses || [])) {
+            const busOn = bus.mix?.on === true;
+            const busFader: number = typeof bus.mix?.fader === "number" ? bus.mix.fader : -Infinity;
+            const isSilent = busOn === false || busFader <= -90;
+            if (!isSilent) continue;
+
+            const feeders: string[] = [];
+            const collectFeeders = (strips: any[], prefix: string) => {
+                for (const strip of (strips || [])) {
+                    const send = (strip.sends || []).find((sd: any) => sd.bus === bus.n);
+                    if (!send) continue;
+                    if (send.on === true && typeof send.level === "number" && send.level > -90) {
+                        feeders.push(`${prefix}${strip.n}${strip.config?.name ? `(${strip.config.name})` : ""}`);
+                    }
+                }
+            };
+            collectFeeders(s.channels, "ch");
+            collectFeeders(s.auxins, "auxin");
+            collectFeeders(s.fxrtns, "fxrtn");
+            if (feeders.length === 0) continue;
+
+            const tag = `bus/${String(bus.n).padStart(2, "0")}`;
+            const busName = bus.config?.name || "?";
+            if (busOn === false) {
+                add("info", tag, "muted-bus-with-inputs",
+                    `MIX${bus.n} (${busName}) is MUTED but fed by ${feeders.length} hot send${feeders.length === 1 ? "" : "s"}: ${feeders.join(", ")}.`);
+            } else {
+                add("info", tag, "silent-bus-with-inputs",
+                    `MIX${bus.n} (${busName}) fader is at -∞ but fed by ${feeders.length} hot send${feeders.length === 1 ? "" : "s"}: ${feeders.join(", ")}.`);
+            }
+        }
+
+        // ----- ORPHAN BUS: hot input sends, but no output sources from it -----
+        const usedBuses = new Set<number>();
+        const collectUsedBus = (list: any[]) => {
+            for (const o of (list || [])) {
+                if (typeof o.src !== "number") continue;
+                if (o.src >= 4 && o.src <= 19) usedBuses.add(o.src - 3);
+            }
+        };
+        collectUsedBus(s.outputs?.main || []);
+        collectUsedBus(s.outputs?.aux || []);
+        collectUsedBus(s.outputs?.p16 || []);
+        collectUsedBus(s.outputs?.aes || []);
+        collectUsedBus(s.outputs?.rec || []);
+        // also: if a bus sends to a matrix, treat as used (matrix is its consumer)
+        for (const b of (s.buses || [])) {
+            const hotMtxSends = (b.sends || []).filter((sd: any) =>
+                sd.on === true && typeof sd.level === "number" && sd.level > -90);
+            if (hotMtxSends.length > 0) usedBuses.add(b.n);
+        }
+        // also: any bus that feeds an FX slot (slot.source like "MIX13") is used
+        const fxSourceRe = /^MIX(\d+)$/i;
+        for (const slot of (s.fx || [])) {
+            for (const k of ["sourceL", "sourceR"]) {
+                const v = slot.source?.[k];
+                if (typeof v !== "string") continue;
+                const m = v.match(fxSourceRe);
+                if (m) usedBuses.add(parseInt(m[1], 10));
+            }
+        }
+        for (const b of (s.buses || [])) {
+            // Does this bus have hot input sends from any strip?
+            let hasHotInput = false;
+            const checkSends = (strip: any) => {
+                const send = (strip.sends || []).find((sd: any) => sd.bus === b.n);
+                if (!send) return;
+                if (send.on === true && typeof send.level === "number" && send.level > -90) hasHotInput = true;
+            };
+            for (const c of (s.channels || [])) checkSends(c);
+            for (const a of (s.auxins || [])) checkSends(a);
+            for (const fr of (s.fxrtns || [])) checkSends(fr);
+            const busOn = b.mix?.on === true;
+            if (hasHotInput && !usedBuses.has(b.n) && busOn) {
+                add("info", `bus/${String(b.n).padStart(2, "0")}`, "orphan-bus",
+                    `MIX${b.n} (${b.config?.name || "?"}) has hot input sends but isn't routed to any output or matrix — orphan bus.`);
+            }
+        }
+
+        // ----- SORT findings: severity (error > warn > info), then path -----
+        const sevRank: Record<string, number> = { error: 0, warn: 1, info: 2 };
+        findings.sort((a, b) => {
+            const sa = sevRank[a.severity] ?? 3, sb = sevRank[b.severity] ?? 3;
+            if (sa !== sb) return sa - sb;
+            return a.path.localeCompare(b.path);
+        });
+
+        return { findings, snapshotMeta: s.meta };
+    }
+
     close(): void {
         this.isConnected = false;
         this.osc.close();
