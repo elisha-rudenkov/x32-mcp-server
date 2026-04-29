@@ -1,4 +1,93 @@
 import OSC from "osc-js";
+import dgram from "dgram";
+import {
+    NODE_SCHEMA,
+    NodeSchemaEntry,
+    findSchema,
+    listSchemas as listSchemasImpl,
+    decodeField,
+    encodeFieldValue,
+} from "./node-schema.js";
+
+// ========== X32node reply parsers ==========
+// X32 /node replies come back on the non-OSC-compliant address "node" (no leading slash).
+// Format: single OSC string arg like '/ch/01/config "Voc1" 1 MG 1\n'
+// Values are space-delimited; names are quoted; bitmasks prefixed %, -∞ dB rendered as "-oo",
+// frequencies rendered in "3k48" shorthand (=3480 Hz).
+
+/** Tokenize a /node reply string. Respects "quoted" values (which may contain spaces). */
+export function parseNodeLine(line: string): { path: string; values: string[] } {
+    const trimmed = line.replace(/\n$/, "").replace(/\s+$/, "");
+    const firstSpace = trimmed.indexOf(" ");
+    const path = firstSpace === -1 ? trimmed : trimmed.substring(0, firstSpace);
+    const rest = firstSpace === -1 ? "" : trimmed.substring(firstSpace + 1);
+    const values: string[] = [];
+    let i = 0;
+    while (i < rest.length) {
+        while (i < rest.length && rest[i] === " ") i++;
+        if (i >= rest.length) break;
+        if (rest[i] === '"') {
+            i++;
+            let out = "";
+            while (i < rest.length && rest[i] !== '"') {
+                if (rest[i] === "\\" && i + 1 < rest.length) {
+                    out += rest[i + 1]; i += 2;
+                } else {
+                    out += rest[i]; i++;
+                }
+            }
+            values.push(out);
+            if (i < rest.length) i++;
+        } else {
+            const start = i;
+            while (i < rest.length && rest[i] !== " ") i++;
+            values.push(rest.substring(start, i));
+        }
+    }
+    return { path, values };
+}
+
+/** X32 dB-string to number: "-oo" → -Infinity, "+3.3" → 3.3, "-44" → -44. */
+export function parseX32Db(s: string): number {
+    if (s === "-oo" || s === "-∞") return -Infinity;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : NaN;
+}
+
+/** X32 frequency shorthand to Hz: "3k48" → 3480, "12k" → 12000, "500" → 500. */
+export function parseX32Freq(s: string): number {
+    const m = s.match(/^(\d+)k(\d*)$/);
+    if (m) {
+        const thousands = parseInt(m[1], 10) * 1000;
+        if (m[2] === "") return thousands;
+        const sub = parseInt(m[2], 10) * Math.pow(10, 3 - m[2].length);
+        return thousands + sub;
+    }
+    return parseFloat(s);
+}
+
+/** X32 bitmask string "%01011010" to integer. */
+export function parseX32Bitmask(s: string): number {
+    if (s.startsWith("%")) return parseInt(s.substring(1), 2);
+    return parseInt(s, 10);
+}
+
+/** X32 boolean: "ON"/"OFF" → true/false. */
+export function parseX32Bool(s: string): boolean {
+    return s === "ON" || s === "TRUE" || s === "1";
+}
+
+/** Encode a JS value for the /  (X32node write) command. Strings with whitespace get quoted. */
+function encodeWriteValue(v: any): string {
+    if (typeof v === "boolean") return v ? "ON" : "OFF";
+    if (typeof v === "number") {
+        if (v === -Infinity) return "-oo";
+        return String(v);
+    }
+    const s = String(v);
+    if (s === "" || /[\s"]/.test(s)) return `"${s.replace(/"/g, '\\"')}"`;
+    return s;
+}
 
 /**
  * Coerce a JS value to the correct JS type for osc-js's inference.
@@ -118,12 +207,29 @@ export function decodeUserOutSource(n: number): string {
     return `UNKNOWN(${n}) — see X32 OSC spec, not fully verified`;
 }
 
+type RawReply = { address: string; args: any[]; raw: string };
+
 export class OSCClient {
     private osc: any;
     private host: string;
     private port: number;
     private responseCallbacks: Map<string, (value: any) => void> = new Map();
     private isConnected: boolean = false;
+
+    // Parallel UDP socket for X32node traffic.
+    // Reasons we can't reuse the osc-js socket:
+    //   1. X32 /node replies land on address "node" (no leading slash). osc-js's OSC parser
+    //      validates addresses and silently drops these, so the "*" listener never fires.
+    //   2. /xinfo replies carry 4 string args, but existing sendAndReceive only surfaces args[0].
+    // This socket speaks raw OSC via a hand-rolled parser so we can see everything.
+    private rawSock: dgram.Socket | null = null;
+    private rawInflight: {
+        matchAddr: (a: string) => boolean;
+        resolve: (r: RawReply) => void;
+        reject: (e: Error) => void;
+        timer: NodeJS.Timeout;
+    } | null = null;
+    private rawQueue: Array<() => void> = [];
 
     constructor(host: string, port: number) {
         this.host = host;
@@ -162,28 +268,259 @@ export class OSCClient {
     }
 
     async connect(): Promise<void> {
+        this.osc.open({ host: "0.0.0.0", port: 0 });
+        this.isConnected = true;
+        console.error("OSC UDP Port ready");
+
+        this.sendCommand("/xremote");
+        setInterval(() => this.sendCommand("/xremote"), 9000);
+
+        this.rawSock = dgram.createSocket("udp4");
+        this.rawSock.on("message", (buf) => this._handleRawReply(buf));
+        this.rawSock.on("error", (e) => console.error("rawSock error:", e));
+        await new Promise<void>((resolve) => {
+            this.rawSock!.bind(0, "0.0.0.0", () => resolve());
+        });
+        console.error("Raw OSC socket bound on port", this.rawSock!.address().port);
+    }
+
+    private _handleRawReply(buf: Buffer): void {
+        try {
+            const readCString = (off: number) => {
+                let end = off;
+                while (end < buf.length && buf[end] !== 0) end++;
+                const s = buf.subarray(off, end).toString("utf8");
+                const padded = Math.ceil((end - off + 1) / 4) * 4;
+                return { s, next: off + padded };
+            };
+            const a = readCString(0);
+            const t = readCString(a.next);
+            if (!t.s.startsWith(",")) return;
+            let off = t.next;
+            const args: any[] = [];
+            let raw = "";
+            for (let i = 1; i < t.s.length; i++) {
+                const tag = t.s[i];
+                if (tag === "s") {
+                    const v = readCString(off);
+                    args.push(v.s);
+                    if (i === 1) raw = v.s;
+                    off = v.next;
+                } else if (tag === "i") {
+                    args.push(buf.readInt32BE(off)); off += 4;
+                } else if (tag === "f") {
+                    args.push(buf.readFloatBE(off)); off += 4;
+                } else if (tag === "T") { args.push(true); }
+                else if (tag === "F") { args.push(false); }
+                else { break; }
+            }
+            if (!this.rawInflight) return;
+            if (!this.rawInflight.matchAddr(a.s)) return;
+            const inflight = this.rawInflight;
+            this.rawInflight = null;
+            clearTimeout(inflight.timer);
+            inflight.resolve({ address: a.s, args, raw });
+            const next = this.rawQueue.shift();
+            if (next) next();
+        } catch {
+            // ignore malformed packets
+        }
+    }
+
+    private _buildOscMessage(address: string, ...args: any[]): Buffer {
+        const m = args.length
+            ? new (OSC as any).Message(address, ...args)
+            : new (OSC as any).Message(address);
+        return Buffer.from(m.pack());
+    }
+
+    /**
+     * Send a raw OSC message and wait for a matching reply on this.rawSock.
+     * Serialized — one in-flight at a time per client. Returns { address, args, raw }.
+     * @param matchAddr filter for the expected reply address (e.g. "node", "/xinfo").
+     */
+    private rawQuery(
+        sendAddress: string,
+        sendArgs: any[],
+        matchAddr: (a: string) => boolean,
+        timeoutMs: number = 1000,
+    ): Promise<RawReply> {
+        if (!this.rawSock) throw new Error("rawSock not initialized — call connect() first");
         return new Promise((resolve, reject) => {
-            try {
-                // Open OSC connection (listening on any available port, all interfaces)
-                this.osc.open({
-                    host: "0.0.0.0",
-                    port: 0,
-                });
-
-                this.isConnected = true;
-                console.error("OSC UDP Port ready");
-
-                // Subscribe to mixer updates
-                this.sendCommand("/xremote");
-
-                // Keep connection alive with periodic /xremote messages
-                setInterval(() => this.sendCommand("/xremote"), 9000);
-
-                resolve();
-            } catch (error) {
-                reject(error);
+            const fire = () => {
+                const buf = this._buildOscMessage(sendAddress, ...sendArgs);
+                const timer = setTimeout(() => {
+                    if (this.rawInflight && this.rawInflight.resolve === resolve) {
+                        this.rawInflight = null;
+                        reject(new Error(`Timeout: ${sendAddress} ${JSON.stringify(sendArgs)}`));
+                        const next = this.rawQueue.shift();
+                        if (next) next();
+                    }
+                }, timeoutMs);
+                this.rawInflight = { matchAddr, resolve, reject, timer };
+                this.rawSock!.send(buf, this.port, this.host);
+            };
+            if (this.rawInflight) {
+                this.rawQueue.push(fire);
+            } else {
+                fire();
             }
         });
+    }
+
+    // ========== X32node primitives ==========
+
+    /**
+     * Request an X32 "node" — a bundle of related parameters at a given path.
+     * Valid paths are enumerated in the pmaillot spec (e.g. ch/NN/config, ch/NN/mix,
+     * ch/NN/eq/B, ch/NN/mix/BB, headamp/NNN, bus/NN/mix, main/st/eq, etc.).
+     * Not recursive: one call returns one node's values.
+     *
+     * Returns { path, raw, values } where `values` is the tokenized space-delimited list
+     * (quoted strings unwrapped). Callers decode individual tokens using parseX32Db/
+     * parseX32Freq/parseX32Bitmask/parseX32Bool as appropriate for the node's schema.
+     */
+    async nodeRead(path: string): Promise<{ path: string; raw: string; values: string[] }> {
+        const clean = path.replace(/^\/+/, "");
+        const reply = await this.rawQuery("/node", [clean], (a) => a === "node");
+        const text = String(reply.args[0] ?? "");
+        const parsed = parseNodeLine(text);
+        return { path: parsed.path, raw: text, values: parsed.values };
+    }
+
+    /**
+     * Write multiple fields of an X32 node atomically using the `/` (X32node) command.
+     * The X32 parses the text, applies all listed values in one pass, and echoes the
+     * command back for flow control.
+     *
+     * Values are provided as a positional array matching the node's field order from the
+     * spec. The spec allows PREFIX-PARTIAL writes — you can send fewer values than the
+     * node has, but the ones you send must be in order from the first field.
+     *
+     * Strings containing whitespace or empty strings are automatically quoted.
+     * Booleans become ON/OFF. -Infinity becomes "-oo".
+     *
+     * Fires-and-forgets: the mixer will echo the command on address "/" but we do not
+     * wait for it. Use nodeRead to verify after.
+     */
+    async nodeWrite(path: string, values: any[]): Promise<void> {
+        if (!this.rawSock) throw new Error("rawSock not initialized");
+        const clean = path.replace(/^\/+/, "");
+        const encoded = values.map(encodeWriteValue).join(" ");
+        const arg = `${clean} ${encoded}`;
+        const buf = this._buildOscMessage("/", arg);
+        this.rawSock.send(buf, this.port, this.host);
+    }
+
+    // ========== Schema-driven node access (Phase D) ==========
+
+    /**
+     * Read a single field of a node by name, decoded per the node-schema entry.
+     * Pass `field` undefined to get the whole node as a {name: value, ...} dict.
+     * Throws if no schema entry matches the path or if the field name is unknown.
+     */
+    async nodeGetField(path: string, field?: string): Promise<any> {
+        const schema = findSchema(path);
+        if (!schema) {
+            throw new Error(`No schema entry for path "${path}". Use osc_list_nodes to enumerate.`);
+        }
+        const node = await this.nodeRead(path);
+        if (field === undefined || field === null || field === "") {
+            const out: Record<string, any> = {};
+            for (let i = 0; i < schema.fields.length; i++) {
+                const f = schema.fields[i];
+                const raw = node.values[i];
+                out[f.name] = raw === undefined ? null : decodeField(f, raw);
+            }
+            return out;
+        }
+        const idx = schema.fields.findIndex((f) => f.name === field);
+        if (idx === -1) {
+            const valid = schema.fields.map((f) => f.name).join(", ");
+            throw new Error(`Field "${field}" not in schema for "${path}". Valid: ${valid}`);
+        }
+        const raw = node.values[idx];
+        if (raw === undefined) return null;
+        return decodeField(schema.fields[idx], raw);
+    }
+
+    /**
+     * Atomically write multiple named fields of a node.
+     * Reads current values to fill in untouched positions, splices in the named
+     * overrides preserving order, encodes per type, and sends one /(X32node) write.
+     * Returns the list of fields that were written and the encoded values.
+     */
+    async nodeSetField(
+        path: string,
+        fields: Record<string, any>,
+    ): Promise<{ wrote: string[]; sent: any[] }> {
+        const schema = findSchema(path);
+        if (!schema) {
+            throw new Error(`No schema entry for path "${path}". Use osc_list_nodes to enumerate.`);
+        }
+        if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+            throw new Error(`fields must be an object {fieldName: value, ...} — got ${typeof fields}`);
+        }
+        const fieldNames = Object.keys(fields);
+        if (fieldNames.length === 0) return { wrote: [], sent: [] };
+        const valid = schema.fields.map((f) => f.name);
+        const unknown = fieldNames.filter((k) => !valid.includes(k));
+        if (unknown.length > 0) {
+            throw new Error(`Unknown fields for "${path}": ${unknown.join(", ")}. Valid: ${valid.join(", ")}`);
+        }
+
+        // We need positional values up through the highest-index field touched.
+        // Untouched leading/middle slots are preserved by reading current state and
+        // re-encoding through the schema (so e.g. db tokens like "-oo" round-trip).
+        const current = await this.nodeRead(path);
+        let lastIdx = -1;
+        for (let i = 0; i < schema.fields.length; i++) {
+            if (schema.fields[i].name in fields) lastIdx = i;
+        }
+        const sent: any[] = [];
+        for (let i = 0; i <= lastIdx; i++) {
+            const f = schema.fields[i];
+            if (f.name in fields) {
+                sent.push(encodeFieldValue(f, fields[f.name]));
+            } else {
+                const raw = current.values[i];
+                // For untouched fields, decode then re-encode so the JS value goes
+                // through the same path (no double-quoting, -oo handled, etc.).
+                if (raw === undefined) {
+                    // /node didn't return this slot — bail rather than guessing.
+                    throw new Error(`Cannot fill untouched field "${f.name}" of "${path}": current /node response had no value at position ${i}`);
+                }
+                sent.push(encodeFieldValue(f, decodeField(f, raw)));
+            }
+        }
+        await this.nodeWrite(path, sent);
+        return { wrote: fieldNames, sent };
+    }
+
+    /** Return the schema, optionally filtered by glob pattern (e.g. "ch/*&zwj;/gate", "config/*"). */
+    listNodeSchemas(filter?: string): NodeSchemaEntry[] {
+        return listSchemasImpl(filter);
+    }
+
+    /** Total number of canonical node entries in the schema. */
+    nodeSchemaCount(): number {
+        return NODE_SCHEMA.length;
+    }
+
+    /**
+     * Identity block: combined /xinfo + /status read in compact form.
+     * /xinfo returns [ip, name, model, firmware]; /status returns [state, ip, name].
+     */
+    async getIdentity(): Promise<{ model: string; firmware: string; ip: string; name: string; state: string }> {
+        const xinfo = await this.rawQuery("/xinfo", [], (a) => a === "/xinfo");
+        const status = await this.rawQuery("/status", [], (a) => a === "/status");
+        return {
+            ip: String(xinfo.args[0] ?? ""),
+            name: String(xinfo.args[1] ?? ""),
+            model: String(xinfo.args[2] ?? ""),
+            firmware: String(xinfo.args[3] ?? ""),
+            state: String(status.args[0] ?? ""),
+        };
     }
 
     private sendCommand(address: string, args?: any[]): void {
@@ -695,57 +1032,101 @@ export class OSCClient {
         return { eqOn: eqOn === 1, eq };
     }
 
+    /**
+     * Read a full channel strip via /node. Replaces ~87 serial leaf reads with 26 /node calls.
+     * Values are in NATIVE UNITS from the /node text format (dB, Hz, enum strings, booleans),
+     * which is a deliberate change from the pre-rewrite normalized-0..1 floats — native units
+     * are what the scene audit heuristics and LLM prose reason about directly.
+     *
+     * Field names match the old shape so downstream consumers key by the same names.
+     *
+     * Node shapes (pmaillot spec, verified against firmware 4.13):
+     *  - ch/NN/config: [name, icon, color, source]
+     *  - ch/NN/mix:    [on, fader, st, pan, mono, mlevel]
+     *  - ch/NN/eq:     [on]
+     *  - ch/NN/eq/B:   [type, f, g, q]        B ∈ 1..4
+     *  - ch/NN/gate:   [on, mode, thr, range, attack, hold, release, keysrc]
+     *  - ch/NN/dyn:    [on, mode, det, env, thr, ratio, knee, mgain, attack, hold, release, pos, keysrc, mix, auto]
+     *  - ch/NN/mix/BB: [on, level, pan, type, panFollow] for odd BB (stereo)
+     *                  [on, level]                      for even BB
+     *  - headamp/NNN:  [gain, phantom]
+     */
     async getChannelStrip(channel: number): Promise<any> {
-        const path = this.getChannelPath(channel);
+        const nn = channel.toString().padStart(2, "0");
         const result: any = { channel };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/mix/fader`);
-        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
-        result.pan = await this.safeRead(`${path}/mix/pan`);
-        result.color = await this.safeRead(`${path}/config/color`);
-        result.source = await this.safeRead(`${path}/config/source`);
+        const readOrNull = async (path: string): Promise<{ values: string[] } | null> => {
+            try { return await this.nodeRead(path); } catch { return null; }
+        };
 
-        // Headamp (preamp gain + phantom)
-        const src = result.source;
-        if (src !== null && src >= 0 && src < 64) {
-            result.headampGain = await this.safeRead(`/headamp/${src.toString().padStart(3, "0")}/gain`);
-            result.headampPhantom = await this.safeRead(`/headamp/${src.toString().padStart(3, "0")}/phantom`);
-        }
-
-        // EQ (4-band)
-        const eqData = await this.readEQBands(path, 4);
-        result.eqOn = eqData.eqOn;
-        result.eq = eqData.eq;
-
-        // Gate (full)
-        result.gateOn = (await this.safeRead(`${path}/gate/on`)) === 1;
-        result.gateThr = await this.safeRead(`${path}/gate/thr`);
-        result.gateRange = await this.safeRead(`${path}/gate/range`);
-        result.gateAttack = await this.safeRead(`${path}/gate/attack`);
-        result.gateHold = await this.safeRead(`${path}/gate/hold`);
-        result.gateRelease = await this.safeRead(`${path}/gate/release`);
-
-        // Compressor (full)
-        result.dynOn = (await this.safeRead(`${path}/dyn/on`)) === 1;
-        result.dynThr = await this.safeRead(`${path}/dyn/thr`);
-        result.dynRatio = await this.safeRead(`${path}/dyn/ratio`);
-        result.dynAttack = await this.safeRead(`${path}/dyn/attack`);
-        result.dynRelease = await this.safeRead(`${path}/dyn/release`);
-        result.dynKnee = await this.safeRead(`${path}/dyn/knee`);
-        result.dynGain = await this.safeRead(`${path}/dyn/gain`);
-
-        // Sends to buses (16 buses)
-        result.sends = [];
+        const config = await readOrNull(`ch/${nn}/config`);
+        const mix = await readOrNull(`ch/${nn}/mix`);
+        const eqNode = await readOrNull(`ch/${nn}/eq`);
+        const eqBands: Array<{ values: string[] } | null> = [];
+        for (let b = 1; b <= 4; b++) eqBands.push(await readOrNull(`ch/${nn}/eq/${b}`));
+        const gate = await readOrNull(`ch/${nn}/gate`);
+        const dyn = await readOrNull(`ch/${nn}/dyn`);
+        const sends: Array<{ values: string[] } | null> = [];
         for (let b = 1; b <= 16; b++) {
-            const sendPath = `${path}/mix/${b.toString().padStart(2, "0")}`;
-            result.sends.push({
-                bus: b,
-                level: await this.safeRead(`${sendPath}/level`),
-                pan: await this.safeRead(`${sendPath}/pan`),
-                type: await this.safeRead(`${sendPath}/type`),
-            });
+            const bb = b.toString().padStart(2, "0");
+            sends.push(await readOrNull(`ch/${nn}/mix/${bb}`));
         }
+
+        // config: [name, icon, color, source]
+        result.name = config?.values[0] ?? null;
+        result.fader = mix ? parseX32Db(mix.values[1]) : null;
+        result.on = mix ? parseX32Bool(mix.values[0]) : null;
+        result.pan = mix?.values[3] !== undefined ? parseFloat(mix.values[3]) : null;
+        result.color = config?.values[2] ?? null;
+        result.source = config?.values[3] !== undefined ? parseInt(config.values[3], 10) : null;
+
+        // Headamp (only for local/aes50a source codes 0..63, matching prior behavior).
+        // NOTE: /node on an unassigned headamp slot times out, hence readOrNull.
+        const src = result.source;
+        if (src !== null && Number.isFinite(src) && src >= 0 && src < 64) {
+            const ha = await readOrNull(`headamp/${src.toString().padStart(3, "0")}`);
+            result.headampGain = ha ? parseX32Db(ha.values[0]) : null;
+            result.headampPhantom = ha ? parseX32Bool(ha.values[1]) : null;
+        }
+
+        // EQ
+        result.eqOn = eqNode ? parseX32Bool(eqNode.values[0]) : null;
+        result.eq = eqBands.map((band, i) => ({
+            band: i + 1,
+            gain: band?.values[2] !== undefined ? parseX32Db(band.values[2]) : null,
+            freq: band?.values[1] !== undefined ? parseX32Freq(band.values[1]) : null,
+            q: band?.values[3] !== undefined ? parseFloat(band.values[3]) : null,
+            type: band?.values[0] ?? null,
+        }));
+
+        // Gate: [on, mode, thr, range, attack, hold, release, keysrc]
+        result.gateOn = gate ? parseX32Bool(gate.values[0]) : null;
+        result.gateThr = gate ? parseX32Db(gate.values[2]) : null;
+        result.gateRange = gate?.values[3] !== undefined ? parseFloat(gate.values[3]) : null;
+        result.gateAttack = gate?.values[4] !== undefined ? parseFloat(gate.values[4]) : null;
+        result.gateHold = gate?.values[5] !== undefined ? parseFloat(gate.values[5]) : null;
+        result.gateRelease = gate?.values[6] !== undefined ? parseFloat(gate.values[6]) : null;
+
+        // Dyn: [on, mode, det, env, thr, ratio, knee, mgain, attack, hold, release, pos, keysrc, mix, auto]
+        result.dynOn = dyn ? parseX32Bool(dyn.values[0]) : null;
+        result.dynThr = dyn ? parseX32Db(dyn.values[4]) : null;
+        result.dynRatio = dyn?.values[5] !== undefined ? parseFloat(dyn.values[5]) : null;
+        result.dynKnee = dyn?.values[6] !== undefined ? parseFloat(dyn.values[6]) : null;
+        result.dynGain = dyn?.values[7] !== undefined ? parseX32Db(dyn.values[7]) : null;
+        result.dynAttack = dyn?.values[8] !== undefined ? parseFloat(dyn.values[8]) : null;
+        result.dynRelease = dyn?.values[10] !== undefined ? parseFloat(dyn.values[10]) : null;
+
+        // Sends: odd buses (stereo-linked) have [on, level, pan, type, panFollow]; even have [on, level].
+        result.sends = sends.map((send, i) => {
+            const bus = i + 1;
+            if (!send) return { bus, level: null, pan: null, type: null };
+            return {
+                bus,
+                level: send.values[1] !== undefined ? parseX32Db(send.values[1]) : null,
+                pan: send.values[2] !== undefined ? parseFloat(send.values[2]) : null,
+                type: send.values[3] ?? null,
+            };
+        });
 
         return result;
     }
@@ -1184,5 +1565,9 @@ export class OSCClient {
     close(): void {
         this.isConnected = false;
         this.osc.close();
+        if (this.rawSock) {
+            try { this.rawSock.close(); } catch { /* socket already closed */ }
+            this.rawSock = null;
+        }
     }
 }

@@ -30,288 +30,7 @@ let emulatorPid: number | null = null;
 
 // Define available tools
 const TOOLS: Tool[] = [
-    // ========== Channel Controls ==========
-    {
-        name: "osc_set_fader",
-        description: "Set the fader level for a channel (0.0 to 1.0)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                level: {
-                    type: "number",
-                    description: "Fader level (0.0 = -∞dB, 0.75 = 0dB, 1.0 = +10dB)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "level"],
-        },
-    },
-    {
-        name: "osc_get_fader",
-        description: "Get the current fader level for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
-    {
-        name: "osc_mute_channel",
-        description: "Mute or unmute a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                mute: {
-                    type: "boolean",
-                    description: "True to mute, false to unmute",
-                },
-            },
-            required: ["channel", "mute"],
-        },
-    },
-    {
-        name: "osc_get_mute",
-        description: "Get the mute status of a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
-    {
-        name: "osc_set_pan",
-        description: "Set the pan position for a channel (-1.0 = left, 0.0 = center, 1.0 = right)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                pan: {
-                    type: "number",
-                    description: "Pan position (-1.0 to 1.0)",
-                    minimum: -1,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "pan"],
-        },
-    },
-    {
-        name: "osc_get_pan",
-        description: "Get the pan position for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
-    {
-        name: "osc_set_channel_name",
-        description: "Set the name of a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                name: {
-                    type: "string",
-                    description: "Channel name (X32 accepts up to 12 characters; longer names get silently truncated by the console)",
-                },
-            },
-            required: ["channel", "name"],
-        },
-    },
-    {
-        name: "osc_get_channel_name",
-        description: "Get the name of a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
     // ========== EQ Controls ==========
-    {
-        name: "osc_set_eq",
-        description: "Set EQ gain for a channel band",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-                gain: {
-                    type: "number",
-                    description: "Gain in dB (-15 to +15)",
-                    minimum: -15,
-                    maximum: 15,
-                },
-            },
-            required: ["channel", "band", "gain"],
-        },
-    },
-    {
-        name: "osc_get_eq",
-        description: "Get EQ gain for a channel band",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-            },
-            required: ["channel", "band"],
-        },
-    },
-    {
-        name: "osc_get_eq_frequency",
-        description: "Get EQ frequency for a channel band (returns raw 0-1 value)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-            },
-            required: ["channel", "band"],
-        },
-    },
-    {
-        name: "osc_get_eq_q",
-        description: "Get EQ Q factor for a channel band (returns raw 0-1 value)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-            },
-            required: ["channel", "band"],
-        },
-    },
-    {
-        name: "osc_get_eq_type",
-        description: "Get EQ type for a channel band (returns raw value: 0=LCut, 1=LShv, 2=PEQ, 3=VEQ, 4=HShv, 5=HCut)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-            },
-            required: ["channel", "band"],
-        },
-    },
-    {
-        name: "osc_get_eq_on",
-        description: "Get whether EQ is enabled for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
     {
         name: "osc_copy_eq",
         description: "Copy all EQ settings (gain, frequency, Q, type, on/off) from one channel to another",
@@ -332,233 +51,6 @@ const TOOLS: Tool[] = [
                 },
             },
             required: ["source_channel", "target_channel"],
-        },
-    },
-    {
-        name: "osc_set_eq_frequency",
-        description: "Set EQ frequency for a channel band",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-                frequency: {
-                    type: "number",
-                    description: "Frequency in Hz",
-                    minimum: 20,
-                    maximum: 20000,
-                },
-            },
-            required: ["channel", "band", "frequency"],
-        },
-    },
-    {
-        name: "osc_set_eq_q",
-        description: "Set EQ Q factor for a channel band",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                band: {
-                    type: "number",
-                    description: "EQ band (1-4)",
-                    minimum: 1,
-                    maximum: 4,
-                },
-                q: {
-                    type: "number",
-                    description: "Q factor (0.1 to 10.0)",
-                    minimum: 0.1,
-                    maximum: 10,
-                },
-            },
-            required: ["channel", "band", "q"],
-        },
-    },
-    {
-        name: "osc_set_eq_on",
-        description: "Enable or disable EQ for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                on: {
-                    type: "boolean",
-                    description: "True to enable, false to disable",
-                },
-            },
-            required: ["channel", "on"],
-        },
-    },
-    // ========== Dynamics Controls ==========
-    {
-        name: "osc_set_gate",
-        description: "Set gate threshold for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                threshold: {
-                    type: "number",
-                    description: "Gate threshold in dB (-80 to 0)",
-                    minimum: -80,
-                    maximum: 0,
-                },
-            },
-            required: ["channel", "threshold"],
-        },
-    },
-    {
-        name: "osc_get_gate",
-        description: "Get gate threshold for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
-    {
-        name: "osc_set_gate_on",
-        description: "Enable or disable gate for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                on: {
-                    type: "boolean",
-                    description: "True to enable, false to disable",
-                },
-            },
-            required: ["channel", "on"],
-        },
-    },
-    {
-        name: "osc_set_compressor",
-        description: "Set compressor threshold and ratio for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                threshold: {
-                    type: "number",
-                    description: "Compressor threshold in dB (-60 to 0)",
-                    minimum: -60,
-                    maximum: 0,
-                },
-                ratio: {
-                    type: "number",
-                    description: "Compression ratio (1.0 to 20.0)",
-                    minimum: 1,
-                    maximum: 20,
-                },
-            },
-            required: ["channel", "threshold", "ratio"],
-        },
-    },
-    {
-        name: "osc_set_compressor_attack",
-        description: "Set compressor attack time for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                attack: {
-                    type: "number",
-                    description: "Attack time (0.0 to 1.0)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "attack"],
-        },
-    },
-    {
-        name: "osc_set_compressor_release",
-        description: "Set compressor release time for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                release: {
-                    type: "number",
-                    description: "Release time (0.0 to 1.0)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "release"],
-        },
-    },
-    {
-        name: "osc_set_compressor_on",
-        description: "Enable or disable compressor for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                on: {
-                    type: "boolean",
-                    description: "True to enable, false to disable",
-                },
-            },
-            required: ["channel", "on"],
         },
     },
     // ========== Bus Controls ==========
@@ -741,85 +233,6 @@ const TOOLS: Tool[] = [
                 },
             },
             required: ["aux", "pan"],
-        },
-    },
-    // ========== Sends ==========
-    {
-        name: "osc_send_to_bus",
-        description: "Set the send level from a channel to a mix bus",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                bus: {
-                    type: "number",
-                    description: "Mix bus number (1-16)",
-                    minimum: 1,
-                    maximum: 16,
-                },
-                level: {
-                    type: "number",
-                    description: "Send level (0.0 to 1.0)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "bus", "level"],
-        },
-    },
-    {
-        name: "osc_get_send_to_bus",
-        description: "Get the send level from a channel to a mix bus",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                bus: {
-                    type: "number",
-                    description: "Mix bus number (1-16)",
-                    minimum: 1,
-                    maximum: 16,
-                },
-            },
-            required: ["channel", "bus"],
-        },
-    },
-    {
-        name: "osc_send_to_aux",
-        description: "Set the send level from a channel to an aux output",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                aux: {
-                    type: "number",
-                    description: "Aux number (1-6)",
-                    minimum: 1,
-                    maximum: 6,
-                },
-                level: {
-                    type: "number",
-                    description: "Send level (0.0 to 1.0)",
-                    minimum: 0,
-                    maximum: 1,
-                },
-            },
-            required: ["channel", "aux", "level"],
         },
     },
     // ========== Main Mix ==========
@@ -1088,22 +501,6 @@ const TOOLS: Tool[] = [
         },
     },
     {
-        name: "osc_get_headamp",
-        description: "Get headamp/preamp settings: gain and phantom power for a given headamp index (0-63 for local, 64-127 for AES50-A, 128-191 for AES50-B)",
-        inputSchema: {
-            type: "object",
-            properties: {
-                index: {
-                    type: "number",
-                    description: "Headamp index (0-191)",
-                    minimum: 0,
-                    maximum: 191,
-                },
-            },
-            required: ["index"],
-        },
-    },
-    {
         name: "osc_get_console_overview",
         description: "Get a high-level overview of the ENTIRE console: all 32 channels (name/fader/mute), 16 buses, 8 DCAs, 6 matrices, 8 aux inputs, 8 FX returns, 8 FX slot types, and main bus. Warning: this reads ~200 parameters so takes several seconds.",
         inputSchema: {
@@ -1154,41 +551,6 @@ const TOOLS: Tool[] = [
         name: "osc_get_routing_overview",
         description: "RECOMMENDED FIRST CALL for any routing work. Returns the full X32 routing topology in one shot: input/output/AES50/Card block assignments (which 8-ch source group feeds each range) PLUS the 32-slot User In table PLUS the 48-slot User Out table, all decoded to human labels. Shows whether each channel range uses legacy 8-ch block routing or firmware-4.0+ per-slot User In (1:1 patching). If inputBlocks shows 'User In 25-32', the per-channel sources for channels 25-32 live in userIn[24..31].",
         inputSchema: { type: "object", properties: {} },
-    },
-    {
-        name: "osc_get_channel_color",
-        description: "Get channel strip color (0-15)",
-        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 } }, required: ["channel"] },
-    },
-    {
-        name: "osc_get_channel_icon",
-        description: "Get channel strip icon index",
-        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 } }, required: ["channel"] },
-    },
-    {
-        name: "osc_set_channel_icon",
-        description: "Set channel strip icon (int enum, 1-74 approximately; see X32 icon list)",
-        inputSchema: { type: "object", properties: { channel: { type: "number", minimum: 1, maximum: 32 }, icon: { type: "number" } }, required: ["channel", "icon"] },
-    },
-    {
-        name: "osc_get_channel_links",
-        description: "Get stereo-link state for each channel pair (1-2, 3-4, ..., 31-32). Returns 16 per-pair booleans.",
-        inputSchema: { type: "object", properties: {} },
-    },
-    {
-        name: "osc_set_channel_link",
-        description: "Link or unlink a channel pair for stereo operation. Pair format: '1-2', '3-4', ..., '31-32'.",
-        inputSchema: { type: "object", properties: { pair: { type: "string" }, linked: { type: "boolean" } }, required: ["pair", "linked"] },
-    },
-    {
-        name: "osc_get_bus_links",
-        description: "Get stereo-link state for each bus pair (1-2, 3-4, ..., 15-16).",
-        inputSchema: { type: "object", properties: {} },
-    },
-    {
-        name: "osc_set_bus_link",
-        description: "Link or unlink a bus pair for stereo operation. Pair format: '1-2', '3-4', ..., '15-16'.",
-        inputSchema: { type: "object", properties: { pair: { type: "string" }, linked: { type: "boolean" } }, required: ["pair", "linked"] },
     },
     {
         name: "osc_list_routing_sources",
@@ -1274,45 +636,6 @@ const TOOLS: Tool[] = [
             required: ["effect", "param", "value"],
         },
     },
-    // ========== Routing ==========
-    {
-        name: "osc_set_channel_source",
-        description: "Set the channel-strip input tap (/ch/NN/config/source). Value selects a tap WITHIN whatever source group is currently feeding this channel's 8-ch routing block — NOT a direct physical input picker. Source map: 0=OFF, 1-32=Input N (routed via the active block), 33-40=AUX/USB in, 41-48=FX return L/R. \n\nIMPORTANT: For per-channel 1:1 physical input mapping (firmware 4.0+), this is usually NOT the right tool. Instead: (a) set the input routing block to 'User In' with osc_custom_command /config/routing/IN/N-M as int, and (b) use osc_set_user_routing_in to patch each of the 32 User In slots to any physical source (Local/AES50A/AES50B/Card/AuxIn). Call osc_get_routing_overview first to see the current topology.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-                source: {
-                    type: "number",
-                    description: "Source number (0-63)",
-                    minimum: 0,
-                    maximum: 63,
-                },
-            },
-            required: ["channel", "source"],
-        },
-    },
-    {
-        name: "osc_get_channel_source",
-        description: "Get the input source for a channel",
-        inputSchema: {
-            type: "object",
-            properties: {
-                channel: {
-                    type: "number",
-                    description: "Channel number (1-32)",
-                    minimum: 1,
-                    maximum: 32,
-                },
-            },
-            required: ["channel"],
-        },
-    },
     // ========== Scenes ==========
     {
         name: "osc_scene_recall",
@@ -1375,6 +698,29 @@ const TOOLS: Tool[] = [
             properties: {},
         },
     },
+    {
+        name: "osc_identity",
+        description: "Get the mixer's identity: model, firmware version, IP address, hostname, and operational state. Wraps /xinfo and /status. Use this as the first call to confirm connectivity and version.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    // ========== X32node (/node) ==========
+    {
+        name: "osc_node_read",
+        description: "Read an X32 'node' — a bundle of related parameters at a given path. Returns the raw space-delimited text the mixer sends, plus the tokenized values. Use this as an escape hatch when you need a parameter not wrapped by a dedicated tool, or to quickly dump a whole section in one round-trip.\n\nValid node paths are enumerated in the pmaillot spec (examples):\n  - ch/NN/config       → [name, icon, color, source]\n  - ch/NN/mix          → [on, fader, st, pan, mono, mlevel]\n  - ch/NN/eq           → [on]\n  - ch/NN/eq/B         → [type, f, g, q]   (B=1..4)\n  - ch/NN/gate         → [on, mode, thr, range, attack, hold, release, keysrc]\n  - ch/NN/dyn          → [on, mode, det, env, thr, ratio, knee, mgain, attack, hold, release, pos, keysrc, mix, auto]\n  - ch/NN/mix/BB       → [on, level, pan, type, panFollow] (odd BB) or [on, level] (even BB)\n  - headamp/NNN        → [gain, phantom]\n  - bus/NN/config, bus/NN/mix, fx/N/par, main/st/config, dca/N, config/mute, config/chlink, ...\n\nPath format: NO leading slash (the mixer is strict about this). Channel/bus/aux/mtx paths use 2-digit zero-padded numbers (ch/01, bus/05). FX slot paths use UNPADDED numbers (fx/1, NOT fx/01). Headamp paths use 3-digit zero-padded (headamp/000..127).\n\nNot recursive: /node ch/01 alone returns only the first child. You must list the specific node path.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: {
+                    type: "string",
+                    description: "X32 node path without leading slash, e.g. 'ch/01/mix', 'fx/1/par', 'headamp/000'",
+                },
+            },
+            required: ["path"],
+        },
+    },
     // ========== Custom Commands ==========
     {
         name: "osc_custom_command",
@@ -1433,6 +779,60 @@ const TOOLS: Tool[] = [
             properties: {},
         },
     },
+    // ========== Schema-driven node tools (Phase D) ==========
+    {
+        name: "osc_list_nodes",
+        description:
+            "List schema entries for X32 /node containers — path patterns, field names, types, ranges, and enum values. Use this first to discover what fields you can read/write via osc_node_get / osc_node_set. Optional glob filter (e.g. \"ch/*/gate\", \"config/*\", \"headamp/*\").",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filter: {
+                    type: "string",
+                    description: "Optional glob pattern to filter the schema (e.g. \"ch/*/eq*\", \"config/*\", \"headamp/*\")",
+                },
+            },
+        },
+    },
+    {
+        name: "osc_node_get",
+        description:
+            "Read one or all fields of an X32 /node container, decoded per schema (db, freq, enums, bitmasks → native JS types). Path examples: \"ch/01/gate\", \"headamp/000\", \"config/mute\", \"ch/03/eq/2\". Omit `field` to get the whole node as a {name: value} dict.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: {
+                    type: "string",
+                    description: "Node path without leading slash, e.g. \"ch/01/gate\", \"headamp/000\", \"config/mute\". See osc_list_nodes for valid paths.",
+                },
+                field: {
+                    type: "string",
+                    description: "Field name within the node. Omit to get the whole node as a dict.",
+                },
+            },
+            required: ["path"],
+        },
+    },
+    {
+        name: "osc_node_set",
+        description:
+            "Atomically write multiple named fields of an X32 /node container in one OSC write. Values are coerced per type: bool accepts true/false/ON/OFF; db accepts numbers (use -Infinity or \"-oo\" for -∞); enum accepts symbolic value (\"GATE\") or numeric index (3); bitmask accepts int or \"%01011010\". Untouched fields are preserved. Example: osc_node_set ch/01/gate {on: true, thr: -30, mode: \"GATE\"}.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: {
+                    type: "string",
+                    description: "Node path without leading slash, e.g. \"ch/01/gate\".",
+                },
+                fields: {
+                    type: "object",
+                    description: "Object mapping field name → new value. Field names must match the schema (see osc_list_nodes).",
+                    additionalProperties: true,
+                },
+            },
+            required: ["path", "fields"],
+        },
+    },
 ];
 
 // Create MCP server
@@ -1459,179 +859,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
         switch (name) {
-            // ========== Channel Controls ==========
-            case "osc_set_fader": {
-                const { channel, level } = args as { channel: number; level: number };
-                await osc.setFader(channel, level);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} fader to ${(level * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_fader": {
-                const { channel } = args as { channel: number };
-                const level = await osc.getFader(channel);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} fader is at ${(level * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_mute_channel": {
-                const { channel, mute } = args as { channel: number; mute: boolean };
-                await osc.muteChannel(channel, mute);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} ${mute ? "muted" : "unmuted"}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_mute": {
-                const { channel } = args as { channel: number };
-                const mute = await osc.getMute(channel);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} is ${mute ? "muted" : "unmuted"}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_pan": {
-                const { channel, pan } = args as { channel: number; pan: number };
-                await osc.setPan(channel, pan);
-                const panText =
-                    pan < -0.1 ? "left" : pan > 0.1 ? "right" : "center";
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} pan to ${panText} (${pan.toFixed(2)})`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_pan": {
-                const { channel } = args as { channel: number };
-                const pan = await osc.getPan(channel);
-                const panText =
-                    pan < -0.1 ? "left" : pan > 0.1 ? "right" : "center";
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} pan is ${panText} (${pan.toFixed(2)})`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_channel_name": {
-                const { channel, name } = args as { channel: number; name: string };
-                await osc.setChannelName(channel, name);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} name to "${name}"`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_channel_name": {
-                const { channel } = args as { channel: number };
-                const name = await osc.getChannelName(channel);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} name is "${name}"`,
-                        },
-                    ],
-                };
-            }
-
             // ========== EQ Controls ==========
-            case "osc_set_eq": {
-                const { channel, band, gain } = args as {
-                    channel: number;
-                    band: number;
-                    gain: number;
-                };
-                await osc.setEQ(channel, band, gain);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} EQ band ${band} to ${gain > 0 ? "+" : ""}${gain}dB`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_eq": {
-                const { channel, band } = args as { channel: number; band: number };
-                const gain = await osc.getEQ(channel, band);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} EQ band ${band} is at ${gain > 0 ? "+" : ""}${gain.toFixed(1)}dB`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_eq_frequency": {
-                const { channel, band } = args as { channel: number; band: number };
-                const freq = await osc.getEQFrequency(channel, band);
-                return {
-                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} frequency: ${freq}` }],
-                };
-            }
-
-            case "osc_get_eq_q": {
-                const { channel, band } = args as { channel: number; band: number };
-                const qVal = await osc.getEQQ(channel, band);
-                return {
-                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} Q: ${qVal}` }],
-                };
-            }
-
-            case "osc_get_eq_type": {
-                const { channel, band } = args as { channel: number; band: number };
-                const eqType = await osc.getEQType(channel, band);
-                const typeNames = ["LCut", "LShv", "PEQ", "VEQ", "HShv", "HCut"];
-                return {
-                    content: [{ type: "text", text: `Channel ${channel} EQ band ${band} type: ${eqType} (${typeNames[eqType] || "unknown"})` }],
-                };
-            }
-
-            case "osc_get_eq_on": {
-                const { channel } = args as { channel: number };
-                const eqOn = await osc.getEQOn(channel);
-                return {
-                    content: [{ type: "text", text: `Channel ${channel} EQ is ${eqOn ? "enabled" : "disabled"}` }],
-                };
-            }
-
             case "osc_copy_eq": {
                 const { source_channel, target_channel } = args as { source_channel: number; target_channel: number };
                 const results: string[] = [];
@@ -1658,158 +886,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 return {
                     content: [{ type: "text", text: `Copied EQ from channel ${source_channel} to channel ${target_channel}:\n${results.join("\n")}` }],
-                };
-            }
-
-            case "osc_set_eq_frequency": {
-                const { channel, band, frequency } = args as {
-                    channel: number;
-                    band: number;
-                    frequency: number;
-                };
-                await osc.setEQFrequency(channel, band, frequency);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} EQ band ${band} frequency to ${frequency}Hz`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_eq_q": {
-                const { channel, band, q } = args as {
-                    channel: number;
-                    band: number;
-                    q: number;
-                };
-                await osc.setEQQ(channel, band, q);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} EQ band ${band} Q to ${q.toFixed(2)}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_eq_on": {
-                const { channel, on } = args as { channel: number; on: boolean };
-                await osc.setEQOn(channel, on);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} EQ ${on ? "enabled" : "disabled"}`,
-                        },
-                    ],
-                };
-            }
-
-            // ========== Dynamics Controls ==========
-            case "osc_set_gate": {
-                const { channel, threshold } = args as {
-                    channel: number;
-                    threshold: number;
-                };
-                await osc.setGate(channel, threshold);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} gate threshold to ${threshold}dB`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_gate": {
-                const { channel } = args as { channel: number };
-                const threshold = await osc.getGate(channel);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} gate threshold is ${threshold.toFixed(1)}dB`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_gate_on": {
-                const { channel, on } = args as { channel: number; on: boolean };
-                await osc.setGateOn(channel, on);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} gate ${on ? "enabled" : "disabled"}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_compressor": {
-                const { channel, threshold, ratio } = args as {
-                    channel: number;
-                    threshold: number;
-                    ratio: number;
-                };
-                await osc.setCompressor(channel, threshold, ratio);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} compressor: ${threshold}dB threshold, ${ratio}:1 ratio`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_compressor_attack": {
-                const { channel, attack } = args as {
-                    channel: number;
-                    attack: number;
-                };
-                await osc.setCompressorAttack(channel, attack);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} compressor attack to ${(attack * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_compressor_release": {
-                const { channel, release } = args as {
-                    channel: number;
-                    release: number;
-                };
-                await osc.setCompressorRelease(channel, release);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} compressor release to ${(release * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_set_compressor_on": {
-                const { channel, on } = args as { channel: number; on: boolean };
-                await osc.setCompressorOn(channel, on);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} compressor ${on ? "enabled" : "disabled"}`,
-                        },
-                    ],
                 };
             }
 
@@ -1931,57 +1007,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         {
                             type: "text",
                             text: `Set aux ${aux} pan to ${panText} (${pan.toFixed(2)})`,
-                        },
-                    ],
-                };
-            }
-
-            // ========== Sends ==========
-            case "osc_send_to_bus": {
-                const { channel, bus, level } = args as {
-                    channel: number;
-                    bus: number;
-                    level: number;
-                };
-                await osc.sendToBus(channel, bus, level);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} send to bus ${bus} at ${(level * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_send_to_bus": {
-                const { channel, bus } = args as {
-                    channel: number;
-                    bus: number;
-                };
-                const level = await osc.getSendToBus(channel, bus);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} send to bus ${bus} is at ${(level * 100).toFixed(1)}%`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_send_to_aux": {
-                const { channel, aux, level } = args as {
-                    channel: number;
-                    aux: number;
-                    level: number;
-                };
-                await osc.sendToAux(channel, aux, level);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} send to aux ${aux} at ${(level * 100).toFixed(1)}%`,
                         },
                     ],
                 };
@@ -2161,14 +1186,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 };
             }
 
-            case "osc_get_headamp": {
-                const { index } = args as { index: number };
-                const ha = await osc.getHeadamp(index);
-                return {
-                    content: [{ type: "text", text: `Headamp ${index}:\n${JSON.stringify(ha, null, 2)}` }],
-                };
-            }
-
             case "osc_get_console_overview": {
                 const overview = await osc.getConsoleOverview();
                 return {
@@ -2209,46 +1226,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "osc_get_routing_overview": {
                 const ov = await osc.getRoutingOverview();
                 return { content: [{ type: "text", text: `Routing overview:\n${JSON.stringify(ov, null, 2)}` }] };
-            }
-
-            case "osc_get_channel_color": {
-                const { channel } = args as { channel: number };
-                const c = await osc.getChannelColor(channel);
-                return { content: [{ type: "text", text: `Channel ${channel} color: ${c}` }] };
-            }
-
-            case "osc_get_channel_icon": {
-                const { channel } = args as { channel: number };
-                const i = await osc.getChannelIcon(channel);
-                return { content: [{ type: "text", text: `Channel ${channel} icon: ${i}` }] };
-            }
-
-            case "osc_set_channel_icon": {
-                const { channel, icon } = args as { channel: number; icon: number };
-                await osc.setChannelIcon(channel, icon);
-                return { content: [{ type: "text", text: `Set channel ${channel} icon to ${icon}` }] };
-            }
-
-            case "osc_get_channel_links": {
-                const links = await osc.getChannelLinks();
-                return { content: [{ type: "text", text: `Channel links:\n${JSON.stringify(links, null, 2)}` }] };
-            }
-
-            case "osc_set_channel_link": {
-                const { pair, linked } = args as { pair: string; linked: boolean };
-                await osc.setChannelLink(pair, linked);
-                return { content: [{ type: "text", text: `Channel pair ${pair} ${linked ? "linked" : "unlinked"}` }] };
-            }
-
-            case "osc_get_bus_links": {
-                const links = await osc.getBusLinks();
-                return { content: [{ type: "text", text: `Bus links:\n${JSON.stringify(links, null, 2)}` }] };
-            }
-
-            case "osc_set_bus_link": {
-                const { pair, linked } = args as { pair: string; linked: boolean };
-                await osc.setBusLink(pair, linked);
-                return { content: [{ type: "text", text: `Bus pair ${pair} ${linked ? "linked" : "unlinked"}` }] };
             }
 
             case "osc_list_routing_sources": {
@@ -2324,36 +1301,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 };
             }
 
-            // ========== Routing ==========
-            case "osc_set_channel_source": {
-                const { channel, source } = args as {
-                    channel: number;
-                    source: number;
-                };
-                await osc.setChannelSource(channel, source);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Set channel ${channel} source to ${source}`,
-                        },
-                    ],
-                };
-            }
-
-            case "osc_get_channel_source": {
-                const { channel } = args as { channel: number };
-                const source = await osc.getChannelSource(channel);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Channel ${channel} source is ${source}`,
-                        },
-                    ],
-                };
-            }
-
             // ========== Scenes ==========
             case "osc_scene_recall": {
                 const { scene } = args as { scene: number };
@@ -2407,6 +1354,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             text: `Mixer Status:\n${JSON.stringify(status, null, 2)}`,
                         },
                     ],
+                };
+            }
+
+            case "osc_identity": {
+                const id = await osc.getIdentity();
+                return {
+                    content: [{ type: "text", text: `Mixer identity:\n${JSON.stringify(id, null, 2)}` }],
+                };
+            }
+
+            case "osc_node_read": {
+                const { path: nodePath } = args as { path: string };
+                const node = await osc.nodeRead(nodePath);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `/node ${nodePath}:\n  raw: ${JSON.stringify(node.raw)}\n  path: ${node.path}\n  values: ${JSON.stringify(node.values)}`,
+                    }],
                 };
             }
 
@@ -2668,6 +1633,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         isError: true,
                     };
                 }
+            }
+
+            // ========== Schema-driven node tools (Phase D) ==========
+            case "osc_list_nodes": {
+                const { filter } = (args ?? {}) as { filter?: string };
+                const entries = osc.listNodeSchemas(filter);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Node schema (${entries.length} of ${osc.nodeSchemaCount()} entries${filter ? `, filter "${filter}"` : ""}):\n${JSON.stringify(entries, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_node_get": {
+                const { path: nodePath, field } = args as { path: string; field?: string };
+                const result = await osc.nodeGetField(nodePath, field);
+                if (field) {
+                    return {
+                        content: [{ type: "text", text: `${nodePath}.${field} = ${JSON.stringify(result)}` }],
+                    };
+                }
+                return {
+                    content: [{ type: "text", text: `${nodePath}:\n${JSON.stringify(result, null, 2)}` }],
+                };
+            }
+
+            case "osc_node_set": {
+                const { path: nodePath, fields } = args as { path: string; fields: Record<string, any> };
+                const { wrote, sent } = await osc.nodeSetField(nodePath, fields);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Wrote ${wrote.length} field(s) on ${nodePath}: ${wrote.join(", ")}\n  encoded payload: ${JSON.stringify(sent)}`,
+                    }],
+                };
             }
 
             default:
