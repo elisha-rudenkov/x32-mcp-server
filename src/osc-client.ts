@@ -8,6 +8,13 @@ import {
     decodeField,
     encodeFieldValue,
 } from "./node-schema.js";
+import {
+    FX_ALGORITHM_COUNT,
+    FxAlgorithmEntry,
+    findFxByCode,
+    listFxAlgorithms as listFxAlgorithmsImpl,
+    resolveFxType,
+} from "./fx-schema.js";
 
 // ========== X32node reply parsers ==========
 // X32 /node replies come back on the non-OSC-compliant address "node" (no leading slash).
@@ -526,6 +533,171 @@ export class OSCClient {
     /** Total number of canonical node entries in the schema. */
     nodeSchemaCount(): number {
         return NODE_SCHEMA.length;
+    }
+
+    // ========== FX algorithm parameter surface (Phase D′) ==========
+
+    /**
+     * Read an FX slot's algorithm + decoded parameters.
+     *
+     * Steps:
+     *   1. Read /fx/N/type (int) — gets the current algorithm code.
+     *   2. Look up the algorithm in FX_ALGORITHM_SCHEMA → ordered param names + types.
+     *   3. /node fx/N/par returns 64 positional values (most are inactive padding
+     *      for algorithms that use < 64 params). Decode the active prefix per the
+     *      algorithm's schema. Trailing inactive slots are dropped.
+     *
+     * Returns:
+     *   {
+     *     slot: 1..8,
+     *     typeCode: int,
+     *     type: "HALL",            // null if code is unknown
+     *     description: "Hall reverb",
+     *     params: { predly: 26, decay: 2.99, ... },  // named, decoded
+     *     extraParams: ["0","0",...] // anything past the algorithm's named slots, raw
+     *   }
+     */
+    async fxGet(slot: number): Promise<{
+        slot: number;
+        typeCode: number;
+        type: string | null;
+        description: string | null;
+        params: Record<string, any>;
+        extraParams: string[];
+    }> {
+        if (slot < 1 || slot > 8) throw new Error(`FX slot out of range: ${slot} (valid: 1..8)`);
+        const typeCode = await this.sendAndReceive(`/fx/${slot}/type`);
+        const algo = findFxByCode(typeof typeCode === "number" ? typeCode : Number(typeCode));
+        const node = await this.nodeRead(`fx/${slot}/par`);
+        const params: Record<string, any> = {};
+        const extra: string[] = [];
+        if (algo) {
+            for (let i = 0; i < algo.params.length; i++) {
+                const f = algo.params[i];
+                const raw = node.values[i];
+                params[f.name] = raw === undefined ? null : decodeField(f, raw);
+            }
+            for (let i = algo.params.length; i < node.values.length; i++) {
+                extra.push(node.values[i]);
+            }
+        } else {
+            // Unknown type — surface raw values so callers aren't blind.
+            for (let i = 0; i < node.values.length; i++) {
+                params[`par${i + 1}`] = node.values[i];
+            }
+        }
+        return {
+            slot,
+            typeCode: typeof typeCode === "number" ? typeCode : Number(typeCode),
+            type: algo?.name ?? null,
+            description: algo?.description ?? null,
+            params,
+            extraParams: extra,
+        };
+    }
+
+    /**
+     * Write one or more named parameters to an FX slot. Reads the slot's current
+     * algorithm to resolve param names → positional indices via the schema.
+     *
+     * `params` is an object mapping parameter names (per the slot's current
+     * algorithm) to values. Values are coerced through encodeFieldValue per the
+     * field's type — bools accept true/false/ON/OFF, db accepts numbers, enum
+     * accepts symbol or numeric index.
+     *
+     * Implementation note: the per-param leaf `/fx/N/par/PP` expects a
+     * NORMALIZED 0..1 float, while /node fx/N/par returns native-unit text
+     * (e.g. "26", "3k48", "ON"). To preserve native-unit round-trip, this
+     * method writes via the /node container address (`fx/N/par`) using
+     * X32node prefix-partial writes — same machinery as nodeSetField. Reads
+     * current /node values, splices in the named overrides preserving order,
+     * encodes all positions through the schema, and sends ONE atomic write.
+     *
+     * Returns the list of params written and the encoded payload.
+     */
+    async fxSet(slot: number, params: Record<string, any>): Promise<{
+        wrote: string[];
+        sent: any[];
+        type: string;
+    }> {
+        if (slot < 1 || slot > 8) throw new Error(`FX slot out of range: ${slot} (valid: 1..8)`);
+        if (!params || typeof params !== "object" || Array.isArray(params)) {
+            throw new Error(`params must be an object {paramName: value, ...} — got ${typeof params}`);
+        }
+        const paramNames = Object.keys(params);
+        if (paramNames.length === 0) return { wrote: [], sent: [], type: "<no-write>" };
+
+        const typeCode = await this.sendAndReceive(`/fx/${slot}/type`);
+        const algo = findFxByCode(typeof typeCode === "number" ? typeCode : Number(typeCode));
+        if (!algo) {
+            throw new Error(`FX slot ${slot} has unknown type code ${typeCode}; no schema match. Use osc_fx_list_algorithms to enumerate.`);
+        }
+
+        // Validate all param names up front so a typo can't half-apply.
+        const validNames = algo.params.map((f) => f.name);
+        const unknown = paramNames.filter((n) => !validNames.includes(n));
+        if (unknown.length > 0) {
+            throw new Error(`Unknown FX params for ${algo.name}: ${unknown.join(", ")}. Valid: ${validNames.join(", ")}`);
+        }
+
+        // Read current /node fx/N/par to preserve untouched fields up to the
+        // last index we're writing. The container has 64 fields; we only need
+        // values up through the highest-index name we're touching.
+        const current = await this.nodeRead(`fx/${slot}/par`);
+        let lastIdx = -1;
+        for (let i = 0; i < algo.params.length; i++) {
+            if (algo.params[i].name in params) lastIdx = i;
+        }
+        const sent: any[] = [];
+        for (let i = 0; i <= lastIdx; i++) {
+            const f = algo.params[i];
+            if (f.name in params) {
+                sent.push(encodeFieldValue(f, params[f.name]));
+            } else {
+                const raw = current.values[i];
+                if (raw === undefined) {
+                    throw new Error(`Cannot fill untouched FX param "${f.name}" at index ${i} of slot ${slot}: /node response had no value at position ${i}`);
+                }
+                sent.push(encodeFieldValue(f, decodeField(f, raw)));
+            }
+        }
+        await this.nodeWrite(`fx/${slot}/par`, sent);
+        return { wrote: paramNames, sent, type: algo.name };
+    }
+
+    /**
+     * Set an FX slot's algorithm by symbolic name ("HALL") or integer code (0).
+     * Writes /fx/N/type. The X32 may reset parameters to algorithm defaults on
+     * type change; callers should re-fetch with fxGet() if they need the new
+     * param state.
+     */
+    async fxSetType(slot: number, typeRef: string | number): Promise<{
+        slot: number;
+        typeCode: number;
+        type: string;
+        previousTypeCode: number;
+    }> {
+        if (slot < 1 || slot > 8) throw new Error(`FX slot out of range: ${slot} (valid: 1..8)`);
+        const algo = resolveFxType(typeRef);
+        const previous = await this.sendAndReceive(`/fx/${slot}/type`);
+        const previousTypeCode = typeof previous === "number" ? previous : Number(previous);
+        this.sendCommand(`/fx/${slot}/type`, [algo.code]);
+        return {
+            slot,
+            typeCode: algo.code,
+            type: algo.name,
+            previousTypeCode,
+        };
+    }
+
+    /** Return the FX algorithm schema, optionally filtered by name/description substring. */
+    listFxAlgorithms(filter?: string): FxAlgorithmEntry[] {
+        return listFxAlgorithmsImpl(filter);
+    }
+
+    /** Total number of FX algorithms in the schema. */
+    fxAlgorithmCount(): number {
+        return FX_ALGORITHM_COUNT;
     }
 
     // ========== Composite signal-flow diagnostics (Phase B) ==========

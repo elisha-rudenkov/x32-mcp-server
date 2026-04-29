@@ -866,6 +866,81 @@ const TOOLS: Tool[] = [
             required: ["dest"],
         },
     },
+    // ========== FX algorithm parameter surface (Phase D′) ==========
+    {
+        name: "osc_fx_list_algorithms",
+        description:
+            "List the X32 FX algorithm schema — type code (0..60), symbolic name (HALL, PLAT, ROOM, ...), description, and per-algorithm parameter list with names/units/ranges. Use this to discover which algorithms are available and what params they expose. Optional filter matches name or description substring (e.g. \"reverb\", \"delay\", \"comp\"). 61 algorithms total.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filter: {
+                    type: "string",
+                    description: "Optional substring filter on algorithm name or description (e.g. \"reverb\", \"delay\", \"comp\", \"eq\").",
+                },
+            },
+        },
+    },
+    {
+        name: "osc_fx_get",
+        description:
+            "Read an FX slot's current algorithm and decoded parameters. Returns {slot, typeCode, type, description, params: {name: value, ...}}. Param names + units come from the FX_ALGORITHM_SCHEMA matched against /fx/N/type. Slots 1..4 are stereo (also reachable via fx/N/source for routing), slots 5..8 are channel-insert FX. Use this before osc_fx_set to discover valid param names for the slot's current algorithm.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: {
+                    type: "number",
+                    description: "FX slot number (1-8).",
+                    minimum: 1,
+                    maximum: 8,
+                },
+            },
+            required: ["slot"],
+        },
+    },
+    {
+        name: "osc_fx_set",
+        description:
+            "Write one or more named parameters to an FX slot. Parameter names must match the slot's current algorithm (use osc_fx_get first to inspect, or osc_fx_list_algorithms to enumerate). Values are coerced per type: bool accepts true/false/ON/OFF; db accepts numbers; enum accepts symbol (\"HALL\") or numeric index. Each param is sent as one OSC write to /fx/N/par/PP — writes are NOT atomic across multiple params. Example: osc_fx_set 1 {decay: 3.5, predly: 20}.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: {
+                    type: "number",
+                    description: "FX slot number (1-8).",
+                    minimum: 1,
+                    maximum: 8,
+                },
+                params: {
+                    type: "object",
+                    description: "Object mapping FX parameter name → new value. Names must match the slot's current algorithm.",
+                    additionalProperties: true,
+                },
+            },
+            required: ["slot", "params"],
+        },
+    },
+    {
+        name: "osc_fx_set_type",
+        description:
+            "Set an FX slot's algorithm. Accepts symbolic name (\"HALL\", \"PLAT\", \"DLY\") or integer code (0..60). Writes /fx/N/type. WARNING: changing the algorithm on the X32 typically resets all 64 parameters to the new algorithm's defaults — re-fetch with osc_fx_get afterwards if you need the new param state.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                slot: {
+                    type: "number",
+                    description: "FX slot number (1-8).",
+                    minimum: 1,
+                    maximum: 8,
+                },
+                type: {
+                    description: "Algorithm name (e.g. \"HALL\") or integer type code (0..60). Use osc_fx_list_algorithms to enumerate.",
+                    oneOf: [{ type: "string" }, { type: "number" }],
+                },
+            },
+            required: ["slot", "type"],
+        },
+    },
     // ========== Scene snapshot + audit (Phase C) ==========
     {
         name: "osc_scene_snapshot",
@@ -1747,6 +1822,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Routing into ${dest}:\n${JSON.stringify(result, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_fx_list_algorithms": {
+                const { filter } = (args ?? {}) as { filter?: string };
+                const entries = osc.listFxAlgorithms(filter);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `FX algorithms (${entries.length} of ${osc.fxAlgorithmCount()}${filter ? `, filter "${filter}"` : ""}):\n${JSON.stringify(entries, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_fx_get": {
+                const { slot } = args as { slot: number };
+                const result = await osc.fxGet(slot);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `FX slot ${slot} (${result.type ?? "unknown"} / code ${result.typeCode}):\n${JSON.stringify(result, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_fx_set": {
+                const { slot, params } = args as { slot: number; params: Record<string, any> };
+                const result = await osc.fxSet(slot, params);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Wrote ${result.wrote.length} param(s) to FX slot ${slot} (${result.type}):\n${JSON.stringify(result.sent, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_fx_set_type": {
+                const { slot, type } = args as { slot: number; type: string | number };
+                const result = await osc.fxSetType(slot, type);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `FX slot ${slot}: ${result.type} (code ${result.typeCode}) — was code ${result.previousTypeCode}. NOTE: type change typically resets params; re-fetch with osc_fx_get if needed.`,
                     }],
                 };
             }
