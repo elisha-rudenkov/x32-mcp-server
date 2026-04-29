@@ -28,8 +28,176 @@ const osc = new OSCClient(OSC_HOST, OSC_PORT);
 let emulatorProcess: ReturnType<typeof spawn> | null = null;
 let emulatorPid: number | null = null;
 
+// ========== Capability reference (returned by osc_capabilities) ==========
+// Single source of LLM-facing context about what the X32 can do, organized
+// to defuse common misconceptions. Read by the LLM via tool call, NOT a docstring,
+// because tool descriptions are loaded into context but tool *responses* are
+// what the LLM actually treats as authoritative observations.
+const CAPABILITIES_DOC = `# X32 / M32 MCP — Capability Reference
+
+**Firmware target: 4.x (latest).** Capabilities below DO NOT match older firmware
+(2.x, 3.x) priors you may have from training data. When in doubt, trust this doc
+over generic X32 knowledge.
+
+## Capabilities you might (wrongly) think don't exist
+
+### Per-slot 1:1 input routing IS supported (firmware 4.0+)
+You are **not** limited to 8-channel input blocks. The X32 has TWO routing layers:
+1. **Block-level** (\`/config/routing/IN/N-M\`): legacy 8-channel-group selector — picks
+   which source group feeds each range of channels.
+2. **User In** (\`/config/userrout/in/01..32\`): **per-channel 1:1 patch table.** Each
+   of the 32 channel slots can be independently assigned to ANY physical source
+   (Local 1-32, AES50A 1-48, AES50B 1-48, Card 1-32, Aux In 1-8, OFF).
+
+When a block is set to \`User In N-M\`, the per-slot table determines the actual
+source for each channel in that range. **This is the modern way to build scenes.**
+
+- Read both layers in one call: \`osc_get_routing_overview\`
+- Patch a specific channel: \`osc_set_user_routing_in({slot, source})\` — accepts
+  labels like \`"Card 1"\`, \`"Local 27"\`, \`"AES50A 5"\`, \`"OFF"\`.
+
+### FX racks are runtime-configurable; never hardcode slot→algorithm assumptions
+All 8 racks are user-configurable. The same slot can host different algorithms at
+different times. Discover at runtime:
+- \`osc_fx_get(slot)\` — read the current algorithm + decoded params
+- \`osc_fx_list_algorithms\` — enumerate all 61 algorithms (with per-algorithm param schemas)
+- \`osc_find_geq_slots\` — scan all 8 racks for any GEQ-class algorithm
+- \`osc_fx_set_type(slot, "HALL")\` — set algorithm by symbolic name (validates slot-class)
+
+**Slot classes:**
+- Slots 1..4 are stereo-class (61 algorithms valid)
+- Slots 5..8 are insert-class (34-algorithm subset valid; \`osc_fx_set_type\` rejects
+  stereo-only algorithms like HALL on these slots)
+
+### Insert FX on bus / matrix / main is supported and dynamically discoverable
+Each bus/matrix/main has an \`insert\` container with \`{on, pos, sel}\`. The \`sel\` field
+points at an FX slot side (e.g. \`"FX5L"\`, \`"FX7"\`). To work with the GEQ on \"main\":
+- \`osc_get_insert_state({target: "main"})\` — resolves to the FX slot + algorithm
+- \`osc_insert_eq_get/set/reset({target})\` — operates on bands keyed by ISO frequency
+  label (\`"20Hz"\`...\`"20kHz"\`, dual algos return \`channelA\`/\`channelB\`)
+
+Targets accepted: \`"bus N"\` (1-16), \`"main"\`, \`"main mono"\`, \`"mtx N"\` (1-6), \`"ch N"\` (1-32).
+
+### Atomic multi-field writes
+\`osc_node_set(path, fields)\` writes multiple fields of a /node container in a single
+OSC packet. Untouched fields are preserved. This is the canonical way to write to
+the X32 — bool, dB, freq, enum, bitmask types all coerce automatically.
+
+### Schema engine covers ~6275 leaf fields across 62 containers
+Use \`osc_list_nodes\` to discover what's available for any path pattern. \`osc_node_get\`
+reads typed values; \`osc_node_set\` writes. This replaces hand-wrapping individual
+setters for every parameter.
+
+### One-shot meter snapshot (not streaming)
+\`osc_meter_snapshot({bank})\` returns dB values for all channels in ~50ms. Banks 0/1/2/3
+implemented. Pair with \`osc_trace_signal\` to debug "no signal at ch N".
+
+### Comprehensive scene audit
+\`osc_scene_snapshot\` walks every /node container in ~1.7s. \`osc_scene_audit\` runs
+~15 deterministic heuristics (feedback risk, gate threshold issues, send-to-muted-bus,
+FX-configured-but-muted, orphan channels, linked-pair drift, etc.).
+
+### Comparisons + schema-driven copy
+\`osc_compare_channels(a, b)\` shows only the fields that differ. \`osc_copy_channel(from, to)\`
+copies processing + sends; preserves destination's identity (name/icon/color/source) and
+group memberships by default. Override with \`includeConfig\`/\`includeGroups\` flags.
+
+## Common misconceptions defused
+
+| Misconception | Reality |
+|---|---|
+| FX5..8 use the same int type-code as FX1..4 | **Wrong.** Different encoding. GEQ = 28 on FX1..4, GEQ = 1 on FX5..8. \`osc_fx_get\` reads the symbolic name via /node and avoids this entirely. |
+| \`/fx/N/par/PP\` accepts native-unit values like \"50ms\" | **Wrong.** The per-leaf write expects a normalized 0..1 float; native values get clipped to range max. \`osc_fx_set\` uses /node-style writes that DO accept native units. |
+| \`/insert/<bus>/geq/*\` paths exist | **Wrong.** GEQ-as-insert means routing FX5..8 (loaded with a GEQ algorithm) through bus/main/mtx insert.sel. Use \`osc_insert_eq_*\` which discovers the slot dynamically. |
+| \`/auxin/N/automix\` is readable like \`/ch/N/automix\` | **Wrong on firmware 4.13.** The /node container times out. \`/ch/N/automix\` works fine. |
+| \`/-action/copychannel\` and \`/-action/clearchannel\` exist | **Wrong.** Not in firmware 4.x. Use \`osc_copy_channel\` (schema-driven copy) instead. |
+| Routing requires switching whole 8-channel blocks | **Wrong on firmware 4.0+.** Set the block to \"User In\" once, then patch individual slots via \`/config/userrout/in/NN\`. See routing section above. |
+| FX paths use zero-padded slot numbers like \`/fx/01/type\` | **Wrong.** FX uses unpadded numbers: \`/fx/1/type\`, \`/fx/8/par/01\`. Padded silently fails. (Other paths like \`/ch/05\`, \`/bus/12\` DO use 2-digit padding — FX is the exception.) |
+| FX has \`/fx/N/on\` or \`/fx/N/mix\` paths | **Wrong.** FX are always instantiated. "Turn off FX 3" means muting the FX-return channel (\`/fxrtn/03/mix/on\`). Wet/dry varies by algorithm and lives in per-slot params. |
+| OSC type tags can be inferred from JS values | **Risky.** X32 silently drops type-mismatched messages on strict addresses (\`/config/color\`, \`/config/icon\`, \`/config/chlink/*\`, scene recall, mute-group, solo). Use \`osc_custom_command\` with explicit \`osctype: "int"\` for these. |
+
+## Recipe workflows
+
+### "Why isn't channel 5 working?"
+1. \`osc_trace_signal({channel: 5})\` — full signal-flow tree
+2. \`osc_meter_snapshot({bank: 0})\` — confirm signal at the input
+3. Fix via \`osc_node_set\` if mute/routing is wrong
+
+### "Audit my scene"
+1. \`osc_scene_snapshot()\` — one-shot snapshot (~1.7s, ~700 fields)
+2. \`osc_scene_audit({snapshot})\` — sorted findings (error/warn/info)
+
+### "Set channel 27 to Card input 1"
+1. \`osc_get_routing_overview()\` — confirm whether the routing block for ch25-32 is set to "User In"
+2a. If yes: \`osc_set_user_routing_in({slot: 27, source: "Card 1"})\` — done
+2b. If no: switch the block first (\`osc_custom_command\` to \`/config/routing/IN/25-32\` with int 22 for User In 25-32), then patch the slot
+
+### "Compare ch1 vs ch2"
+\`osc_compare_channels({a: 1, b: 2})\` — returns only the fields that differ.
+
+### "Copy ch1's processing to ch2"
+\`osc_copy_channel({from: 1, to: 2})\` — preserves ch2's identity by default.
+
+### "Find the GEQ on the main mix"
+\`osc_get_insert_state({target: "main"})\` — shows insert.sel + which algorithm is in the routed slot.
+
+### "Discover what algorithms are available for FX rack 6"
+\`osc_fx_list_algorithms\` — full schema. Filter the response to entries with \`slots.insert == true\` (slots 5..8 only accept those).
+
+### "Check if FX1 has too long a reverb tail"
+\`osc_fx_get({slot: 1})\` — returns \`{type, params}\` with named params. If type is HALL/PLAT/etc., the \`decay\` param is in seconds.
+
+## Out of scope (intentional skips — don't try to wrap)
+
+- **Talkback** (\`/config/talk/*\`)
+- **Monitor / headphone** (\`/-stat/monitor/*\`)
+- **Custom user-assignable controls** (\`/config/userctrl/*\`)
+- **Scene/show file management** (\`/-show/*\`, \`/-snap/*\`, \`/-libs/*\`)
+- **Save/load actions** (\`/-action/save*\`, \`/-action/load*\`, \`/-action/goscene\`, etc.)
+- **Console preferences** (\`/-prefs/*\`)
+- **USB recorder** (\`/-usb/*\`)
+- **Streaming / subscriptions** — meter banks beyond 0/1/2/3, real-time updates
+- **DP48 personal mixer** (\`/dp48/*\`)
+
+When the user asks for one of these, tell them it's out of scope and suggest the X32-Edit
+software or the console UI as the appropriate tool.
+
+## Tool surface
+
+70 MCP tools, organized roughly:
+- **\`osc_capabilities\`** — this doc
+- **\`osc_identity\`** — model + firmware + IP + name in one call
+- **Schema-driven (3)**: \`osc_list_nodes\`, \`osc_node_get\`, \`osc_node_set\`
+- **Channel/strip composites**: \`osc_get_channel_strip\`, \`osc_get_bus_strip\`, etc.
+- **Scene snapshot / audit (2)**: \`osc_scene_snapshot\`, \`osc_scene_audit\`
+- **Signal-flow diagnostics (2)**: \`osc_trace_signal\`, \`osc_find_routing\`
+- **FX (4)**: \`osc_fx_get\`, \`osc_fx_set\`, \`osc_fx_set_type\`, \`osc_fx_list_algorithms\`
+- **Insert-EQ (5)**: \`osc_find_geq_slots\`, \`osc_get_insert_state\`, \`osc_insert_eq_get/set/reset\`
+- **Meter (1)**: \`osc_meter_snapshot\`
+- **Comparison + copy (3)**: \`osc_compare_channels\`, \`osc_compare_scenes\`, \`osc_copy_channel\`
+- **Routing (7)**: \`osc_get_routing_overview\` (recommended), \`osc_get/set_user_routing*\`
+- **Custom escape hatch**: \`osc_custom_command\` (typed args + read-back)
+- **Legacy direct setters** (~30): per-feature getters/setters retained for compatibility
+
+For full coverage details run \`spec-coverage.js\` or read \`SPEC_COVERAGE.md\`.
+
+## Hard rules
+- **Never assume slot N hosts algorithm X.** Always read \`/fx/N/type\` first.
+- **Never write native units to \`/fx/N/par/PP\` leaf.** Use \`osc_fx_set\` which handles encoding.
+- **Never assume routing is 8-channel block only.** Check \`osc_get_routing_overview\`.
+- **Confirm before destructive actions** (mute main, copy over a configured channel, change FX algorithm).
+- **Restore state after probing.** Capture pre-state, modify, restore.
+`;
+
 // Define available tools
 const TOOLS: Tool[] = [
+    // ========== Discovery / capability reference ==========
+    {
+        name: "osc_capabilities",
+        description:
+            "CALL THIS FIRST when starting work with the X32 or whenever you're uncertain whether something is supported. Returns a structured capability reference for the X32/M32 firmware 4.x — what's possible, what's intentionally out of scope, common misconceptions explicitly defused (especially: per-slot 1:1 routing IS supported and you are NOT bound to 8-channel input blocks; FX rack contents are user-configurable so never assume \"slot N hosts algorithm X\"; FX5..8 use a different integer type-code than FX1..4; the per-leaf /fx/N/par/PP write expects a normalized 0..1 float not native units, etc.), and recipe workflows for common goals. This single call replaces hunting through 70 individual tool descriptions.",
+        inputSchema: { type: "object", properties: {} },
+    },
     // ========== EQ Controls ==========
     {
         name: "osc_copy_eq",
@@ -510,7 +678,8 @@ const TOOLS: Tool[] = [
     },
     {
         name: "osc_get_routing",
-        description: "Get full console routing: FX source assignments (which bus feeds which FX), input routing blocks, output routing blocks, AES50 routing, and card routing",
+        description:
+            "Legacy block-level routing read: FX sources, input/output/AES50/Card BLOCK assignments only (8-channel groups). Does NOT include the per-slot User In / User Out tables — for those use osc_get_routing_overview (recommended) or osc_get_user_routing. On firmware 4.0+, individual channels are usually patched via /config/userrout/in/NN (1:1 patching), not by changing block assignments. Prefer osc_get_routing_overview unless you specifically need block-only data.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -526,7 +695,8 @@ const TOOLS: Tool[] = [
     },
     {
         name: "osc_get_user_routing_in",
-        description: "Get a single User In routing slot assignment (1-32)",
+        description:
+            "Read a single User In slot's source assignment (slot 1-32). Returns {source: int, sourceLabel: \"Card 1\" / \"Local 27\" / \"AES50A 5\" / \"OFF\" / etc.}. Per-slot 1:1 patching, firmware 4.0+. The source only takes effect if the corresponding /config/routing/IN block is set to 'User In'.",
         inputSchema: {
             type: "object",
             properties: {
@@ -559,7 +729,8 @@ const TOOLS: Tool[] = [
     },
     {
         name: "osc_get_user_routing_out",
-        description: "Get a single User Out routing slot assignment (1-48)",
+        description:
+            "Read a single User Out slot's source assignment (slot 1-48). Returns {source: int, sourceLabel: ...}. Per-slot 1:1 output patching, firmware 4.0+. Only takes effect if the corresponding /config/routing/OUT block is set to 'User Out'.",
         inputSchema: {
             type: "object",
             properties: {
@@ -570,7 +741,8 @@ const TOOLS: Tool[] = [
     },
     {
         name: "osc_set_user_routing_out",
-        description: "Set a single User Out routing slot's source (1-48). Source value is an integer representing the signal source per X32 OSC spec.",
+        description:
+            "Per-slot 1:1 output routing (firmware 4.0+). Patches a single User Out slot (1-48) to any internal signal source via integer code. Only takes effect if the corresponding /config/routing/OUT block is set to 'User Out'. For human-readable label patching on the input side, see osc_set_user_routing_in.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1119,6 +1291,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
         switch (name) {
+            // ========== Discovery / capability reference ==========
+            case "osc_capabilities": {
+                return {
+                    content: [{ type: "text", text: CAPABILITIES_DOC }],
+                };
+            }
+
             // ========== EQ Controls ==========
             case "osc_copy_eq": {
                 const { source_channel, target_channel } = args as { source_channel: number; target_channel: number };

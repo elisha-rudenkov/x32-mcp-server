@@ -1,12 +1,12 @@
 # X32 MCP — Spec Coverage
 
-Generated 2026-04-29 05:57:37 UTC by `spec-coverage.js`. Run `node spec-coverage.js` to refresh.
+Generated 2026-04-29 06:10:08 UTC by `spec-coverage.js`. Run `node spec-coverage.js` to refresh.
 
 **Live mixer**: X32 `4.13` at `192.168.1.248` (X32-05-1A-58, state=active)
 
 ## Summary
 
-- **MCP tools exposed**: 70
+- **MCP tools exposed**: 71
 - **Schema containers** (`/node` patterns): 62
 - **Concrete paths** (after range expansion): 1738
 - **Total leaf fields** addressable via schema: 6275
@@ -178,8 +178,9 @@ Sample concrete paths that timed out or returned empty. Often indicates an inact
 
 - `osc_custom_command`
 
-### Other (18)
+### Other (19)
 
+- `osc_capabilities`
 - `osc_get_all_effects`
 - `osc_get_console_overview`
 - `osc_get_dca`
