@@ -941,6 +941,48 @@ const TOOLS: Tool[] = [
             required: ["slot", "type"],
         },
     },
+    // ========== Convenience verbs & comparisons (Phase F) ==========
+    {
+        name: "osc_compare_channels",
+        description:
+            "Diff two channel strips (1-32 each) and return only the fields that differ. Reads both via getChannelStrip in parallel (~80ms). Output: { differences: [{ path, a, b }, ...], identical: bool, elapsedMs }. Path uses dot+bracket notation (\"mix.fader\", \"eqBands[2].g\", \"sends[5].on\"). Floats within ±0.01 are treated as equal to absorb encoding wobble. Use for \"why does vocal 2 sound different from vocal 1\" — the LLM gets a small structured diff instead of two full strips.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                a: { type: "number", description: "First channel (1-32)", minimum: 1, maximum: 32 },
+                b: { type: "number", description: "Second channel (1-32)", minimum: 1, maximum: 32 },
+            },
+            required: ["a", "b"],
+        },
+    },
+    {
+        name: "osc_compare_scenes",
+        description:
+            "Diff two scene snapshots (as returned by osc_scene_snapshot). Pure data — no mixer reads. Returns { differences: [{ path, a, b }, ...], identical: bool, sectionCounts: { channels: N, buses: M, ... } }. Useful for comparing a saved snapshot against current state to find drift, or comparing two saved scenes side by side. Excludes the meta section (captured_at / wall_ms always differ).",
+        inputSchema: {
+            type: "object",
+            properties: {
+                snapshotA: { type: "object", description: "First snapshot (from osc_scene_snapshot).", additionalProperties: true },
+                snapshotB: { type: "object", description: "Second snapshot.", additionalProperties: true },
+            },
+            required: ["snapshotA", "snapshotB"],
+        },
+    },
+    {
+        name: "osc_copy_channel",
+        description:
+            "Copy a channel strip's processing + sends from one channel to another using the schema engine. By default copies: mix, eq + 4 EQ bands, gate + filter, dyn + filter, insert, preamp, delay, automix, all 16 bus sends. By default PRESERVES the destination's identity (name/icon/color/source) and group memberships (DCA / mute groups). Pass includeConfig=true to also copy identity, includeGroups=true to also copy DCA/mute groups. Non-fatal: a failure on one container doesn't abort the rest — failed containers are reported separately.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                from: { type: "number", description: "Source channel (1-32).", minimum: 1, maximum: 32 },
+                to: { type: "number", description: "Destination channel (1-32). Must differ from `from`.", minimum: 1, maximum: 32 },
+                includeConfig: { type: "boolean", description: "Also copy identity (name, icon, color, source). Default false.", default: false },
+                includeGroups: { type: "boolean", description: "Also copy DCA and mute-group memberships. Default false.", default: false },
+            },
+            required: ["from", "to"],
+        },
+    },
     // ========== Meter snapshot (Phase E) ==========
     {
         name: "osc_meter_snapshot",
@@ -1951,6 +1993,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `FX slot ${slot}: ${result.type} (code ${result.typeCode}) — was code ${result.previousTypeCode}. NOTE: type change typically resets params; re-fetch with osc_fx_get if needed.`,
+                    }],
+                };
+            }
+
+            case "osc_compare_channels": {
+                const { a, b } = args as { a: number; b: number };
+                const r = await osc.compareChannelStrips(a, b);
+                return {
+                    content: [{
+                        type: "text",
+                        text: r.identical
+                            ? `ch ${a} and ch ${b} are identical (compared in ${r.elapsedMs}ms).`
+                            : `ch ${a} vs ch ${b} — ${r.differences.length} differences (${r.elapsedMs}ms):\n${JSON.stringify(r, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_compare_scenes": {
+                const { snapshotA, snapshotB } = args as { snapshotA: any; snapshotB: any };
+                const r = osc.compareScenes(snapshotA, snapshotB);
+                return {
+                    content: [{
+                        type: "text",
+                        text: r.identical
+                            ? `Scenes are identical (excluding meta).`
+                            : `Scene diff — ${r.differences.length} differences across sections ${JSON.stringify(r.sectionCounts)}:\n${JSON.stringify(r, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_copy_channel": {
+                const { from, to, includeConfig, includeGroups } = args as {
+                    from: number; to: number; includeConfig?: boolean; includeGroups?: boolean;
+                };
+                const r = await osc.copyChannel(from, to, { includeConfig, includeGroups });
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Copied ch ${from} → ch ${to} (${r.elapsedMs}ms): ${r.copied.length} containers copied${r.skipped.length ? `, ${r.skipped.length} skipped` : ""}${r.failed.length ? `, ${r.failed.length} FAILED` : ""}.\n${JSON.stringify(r, null, 2)}`,
                     }],
                 };
             }

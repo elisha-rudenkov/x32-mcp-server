@@ -3368,6 +3368,159 @@ export class OSCClient {
         return { findings, snapshotMeta: s.meta };
     }
 
+    // ========== Convenience verbs & comparisons (Phase F) ==========
+
+    /**
+     * Diff two channel strips and return only the fields that differ.
+     *
+     * Reads both channels via getChannelStrip (~26 /node calls each, ~80ms total),
+     * walks the result recursively, and emits one entry per leaf where the values
+     * disagree. Useful for "why does vocal 2 sound different from vocal 1" —
+     * the LLM gets a small, structured list instead of two full strips to diff.
+     *
+     * Path notation: dot-separated for objects, bracket for arrays.
+     * Example outputs: "mix.fader", "eqBands[2].g", "sends[5].on".
+     */
+    async compareChannelStrips(channelA: number, channelB: number): Promise<{
+        a: number;
+        b: number;
+        differences: Array<{ path: string; a: any; b: any }>;
+        identical: boolean;
+        elapsedMs: number;
+    }> {
+        if (channelA < 1 || channelA > 32) throw new Error(`channelA out of range: ${channelA}`);
+        if (channelB < 1 || channelB > 32) throw new Error(`channelB out of range: ${channelB}`);
+        const t0 = Date.now();
+        const [stripA, stripB] = await Promise.all([
+            this.getChannelStrip(channelA),
+            this.getChannelStrip(channelB),
+        ]);
+        const elapsedMs = Date.now() - t0;
+        const differences = diffDeep(stripA, stripB, "");
+        return {
+            a: channelA,
+            b: channelB,
+            differences,
+            identical: differences.length === 0,
+            elapsedMs,
+        };
+    }
+
+    /**
+     * Diff two scene snapshots (as returned by sceneSnapshot). Pure data — no
+     * mixer reads, so callers can compare an old saved snapshot against a fresh
+     * one to find drift. Output structure mirrors compareChannelStrips but with
+     * per-section grouping (channels[], buses[], main, dcas[], etc.).
+     *
+     * Excludes the meta section by default (captured_at / wall_ms always differ).
+     */
+    compareScenes(snapA: any, snapB: any): {
+        differences: Array<{ path: string; a: any; b: any }>;
+        identical: boolean;
+        sectionCounts: Record<string, number>;
+    } {
+        const a = { ...(snapA ?? {}) };
+        const b = { ...(snapB ?? {}) };
+        delete a.meta;
+        delete b.meta;
+        const diffs = diffDeep(a, b, "");
+        const sectionCounts: Record<string, number> = {};
+        for (const d of diffs) {
+            const root = d.path.split(/[.\[]/, 1)[0] || "(root)";
+            sectionCounts[root] = (sectionCounts[root] || 0) + 1;
+        }
+        return {
+            differences: diffs,
+            identical: diffs.length === 0,
+            sectionCounts,
+        };
+    }
+
+    /**
+     * Schema-driven channel copy. Reads source channel's /node containers and
+     * writes them to the destination — slot-agnostic and faithful to whatever
+     * the source actually has (vs. relying on a hypothetical /-action/copychannel
+     * which doesn't exist on firmware 4.13).
+     *
+     * Containers copied by default (the "sound" of the channel):
+     *   mix, eq, eq/1..4, gate, gate/filter, dyn, dyn/filter,
+     *   insert, preamp, delay, automix, mix/01..16 (sends to buses)
+     *
+     * Containers preserved on the destination by default:
+     *   config (name, icon, color, source) — identity stays with the channel
+     *   grp (DCA + mute group memberships) — routing stays with the channel
+     *
+     * Pass `includeConfig: true` to also copy identity (name/icon/color/source).
+     * Pass `includeGroups: true` to also copy DCA / mute group memberships.
+     *
+     * Returns the list of containers actually written + any that failed (failures
+     * are non-fatal so a partial copy is preferable to a throw mid-way).
+     *
+     * Known firmware 4.13 quirk: log-scale time params on the dyn container
+     * (release, hold, attack) may not propagate exactly via /node prefix-partial
+     * writes — the destination may keep its prior value or snap to a different
+     * bucket. Run osc_compare_channels post-copy and explicitly osc_node_set
+     * any time fields that didn't take.
+     */
+    async copyChannel(from: number, to: number, options: {
+        includeConfig?: boolean;
+        includeGroups?: boolean;
+    } = {}): Promise<{
+        from: number;
+        to: number;
+        copied: string[];
+        skipped: string[];
+        failed: Array<{ container: string; error: string }>;
+        elapsedMs: number;
+    }> {
+        if (from < 1 || from > 32) throw new Error(`from out of range: ${from}`);
+        if (to < 1 || to > 32) throw new Error(`to out of range: ${to}`);
+        if (from === to) throw new Error(`from === to (${from}); copy is a no-op`);
+        const t0 = Date.now();
+        const fromNN = String(from).padStart(2, "0");
+        const toNN = String(to).padStart(2, "0");
+
+        const containers: string[] = [
+            "mix", "eq", "eq/1", "eq/2", "eq/3", "eq/4",
+            "gate", "gate/filter", "dyn", "dyn/filter",
+            "insert", "preamp", "delay", "automix",
+        ];
+        // Sends mix/01..16 (both odd full-stereo and even reduced shapes)
+        for (let b = 1; b <= 16; b++) containers.push(`mix/${String(b).padStart(2, "0")}`);
+
+        if (options.includeConfig) containers.unshift("config");
+        if (options.includeGroups) containers.push("grp");
+
+        const copied: string[] = [];
+        const skipped: string[] = [];
+        const failed: Array<{ container: string; error: string }> = [];
+
+        for (const container of containers) {
+            const srcPath = `ch/${fromNN}/${container}`;
+            const dstPath = `ch/${toNN}/${container}`;
+            try {
+                const srcFields = await this.nodeGetField(srcPath);
+                if (!srcFields || typeof srcFields !== "object") {
+                    skipped.push(container);
+                    continue;
+                }
+                await this.nodeSetField(dstPath, srcFields);
+                copied.push(container);
+            } catch (e) {
+                failed.push({ container, error: e instanceof Error ? e.message : String(e) });
+            }
+        }
+
+        return {
+            from,
+            to,
+            copied,
+            skipped,
+            failed,
+            elapsedMs: Date.now() - t0,
+        };
+    }
+
     close(): void {
         this.isConnected = false;
         this.osc.close();
@@ -3376,4 +3529,52 @@ export class OSCClient {
             this.rawSock = null;
         }
     }
+}
+
+// ========== Deep-diff helper (Phase F) ==========
+
+/**
+ * Recursive structural diff. Walks two values in parallel; emits one entry
+ * per leaf where they disagree. Uses === for primitives, recurses into objects
+ * and arrays. Treats `undefined` and `null` as equivalent so optional fields
+ * don't generate noise.
+ */
+function diffDeep(a: any, b: any, path: string): Array<{ path: string; a: any; b: any }> {
+    if (a === b) return [];
+    if (a == null && b == null) return [];
+
+    const aIsArr = Array.isArray(a), bIsArr = Array.isArray(b);
+    const aIsObj = a !== null && typeof a === "object" && !aIsArr;
+    const bIsObj = b !== null && typeof b === "object" && !bIsArr;
+
+    // Primitive mismatch (or shape mismatch where one side is object/array)
+    if (aIsArr !== bIsArr || aIsObj !== bIsObj) {
+        return [{ path: path || "(root)", a, b }];
+    }
+
+    if (aIsArr) {
+        const len = Math.max(a.length, b.length);
+        const out: Array<{ path: string; a: any; b: any }> = [];
+        for (let i = 0; i < len; i++) {
+            out.push(...diffDeep(a[i], b[i], `${path}[${i}]`));
+        }
+        return out;
+    }
+
+    if (aIsObj) {
+        const keys = new Set<string>([...Object.keys(a), ...Object.keys(b)]);
+        const out: Array<{ path: string; a: any; b: any }> = [];
+        for (const k of keys) {
+            const next = path ? `${path}.${k}` : k;
+            out.push(...diffDeep(a[k], b[k], next));
+        }
+        return out;
+    }
+
+    // Both primitive, not equal
+    // Floats sometimes wobble by a tiny epsilon on round-trip — tolerate ≤0.01
+    if (typeof a === "number" && typeof b === "number" && Math.abs(a - b) <= 0.01) {
+        return [];
+    }
+    return [{ path: path || "(root)", a, b }];
 }
