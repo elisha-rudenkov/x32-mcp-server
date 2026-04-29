@@ -941,6 +941,26 @@ const TOOLS: Tool[] = [
             required: ["slot", "type"],
         },
     },
+    // ========== Meter snapshot (Phase E) ==========
+    {
+        name: "osc_meter_snapshot",
+        description:
+            "One-shot snapshot of mixer meters, decoded to named dB values. Pairs with osc_trace_signal for \"is there signal at ch 5\" diagnostics. Returns a compact dict {ch01: -18.3, bus01: -12.1, ...}; channels below threshold (-90 dBfs default) are omitted to keep the response light. Banks: 0 = per-channel post-headamp + auxes/FX/buses/matrices (70 floats); 1 = post-fader levels + gate GR + dyn GR per channel (96 floats); 2 = bus/matrix/main levels with their dyn GR (49 floats); 3 = aux sends + aux returns + FX returns (22 floats). Banks 4..15 are RTA / per-FX / console-VU and are intentionally not exposed.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                bank: {
+                    type: "number",
+                    description: "Meter bank: 0 (per-channel input), 1 (post-fader + GR), 2 (bus/matrix/main + GR), 3 (aux/fx). Default 0.",
+                    enum: [0, 1, 2, 3],
+                },
+                threshold_db: {
+                    type: "number",
+                    description: "dBfs threshold; level meters below this are omitted (default -90). Pass -Infinity / very-negative to keep everything. Doesn't affect gain-reduction meters (those are filtered to those actively reducing).",
+                },
+            },
+        },
+    },
     // ========== Insert-effect surface (Phase D″) ==========
     {
         name: "osc_find_geq_slots",
@@ -1931,6 +1951,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `FX slot ${slot}: ${result.type} (code ${result.typeCode}) — was code ${result.previousTypeCode}. NOTE: type change typically resets params; re-fetch with osc_fx_get if needed.`,
+                    }],
+                };
+            }
+
+            case "osc_meter_snapshot": {
+                const { bank, threshold_db } = (args ?? {}) as { bank?: number; threshold_db?: number };
+                const snap = await osc.meterSnapshot(bank ?? 0, threshold_db ?? -90);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Meter snapshot bank ${snap.bank} (${snap.description}, ${snap.elapsedMs}ms, ${snap.floatCount} floats):\n${JSON.stringify(snap, null, 2)}`,
                     }],
                 };
             }

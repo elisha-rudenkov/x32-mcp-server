@@ -88,6 +88,178 @@ export function parseX32Bool(s: string): boolean {
     return s === "ON" || s === "TRUE" || s === "1";
 }
 
+// ========== Meter blob helpers (Phase E) ==========
+
+/** Read a NUL-terminated, 4-byte-padded OSC C-string from a buffer at offset. */
+function readCStringFrom(buf: Buffer, off: number): { s: string; next: number } {
+    let end = off;
+    while (end < buf.length && buf[end] !== 0) end++;
+    const s = buf.subarray(off, end).toString("utf8");
+    const padded = Math.ceil((end - off + 1) / 4) * 4;
+    return { s, next: off + padded };
+}
+
+/** Build an OSC `/meters ,s <bank-tag>` request packet by hand (osc-js doesn't expose
+ *  the right shape for a single-string arg cleanly). */
+function buildMetersRequest(bank: number): Buffer {
+    const padNul = (s: string): Buffer => {
+        const raw = Buffer.from(s + "\0");
+        const padded = Math.ceil(raw.length / 4) * 4;
+        return Buffer.concat([raw, Buffer.alloc(padded - raw.length)]);
+    };
+    return Buffer.concat([padNul("/meters"), padNul(",s"), padNul(`/meters/${bank}`)]);
+}
+
+/** Convert linear meter value to dBfs. 0 → -∞. */
+function linToDbfs(v: number): number {
+    if (!Number.isFinite(v) || v <= 0) return -Infinity;
+    return 20 * Math.log10(v);
+}
+
+/** Convert linear gain-reduction value to dB. 1.0 → 0 dB (no reduction); 0.5 → -6 dB. */
+function linToGrDb(v: number): number {
+    if (!Number.isFinite(v) || v <= 0) return -Infinity;
+    return 20 * Math.log10(v);
+}
+
+/**
+ * Decode a meter blob into an LLM-friendly named dict per bank layout.
+ *
+ * Bank 0 (70 floats):  ch01..32, auxin1..8, fxrtn1L/1R..4L/4R, bus01..16, mtx01..06
+ * Bank 1 (96 floats):  ch01..32 post-fader, ch01..32 gate-GR, ch01..32 dyn-GR
+ * Bank 2 (49 floats):  bus01..16, mtx01..06, mainL, mainR, mainM, then GR for the same
+ * Bank 3 (22 floats):  auxsnd01..06, auxin1..8, fxrtn1L..4R
+ */
+function decodeMeterBlob(
+    bank: number,
+    floats: number[],
+    thresholdDb: number,
+    elapsedMs: number,
+): {
+    bank: number;
+    description: string;
+    elapsedMs: number;
+    floatCount: number;
+    levels?: Record<string, number>;
+    gateGainReduction?: Record<string, number>;
+    dynGainReduction?: Record<string, number>;
+} {
+    const passLevel = (db: number) => Number.isFinite(db) && db >= thresholdDb;
+    const passGr = (db: number) => Number.isFinite(db) && db < -0.05;  // only show GR when actively reducing
+
+    const result: any = { bank, description: "", elapsedMs, floatCount: floats.length };
+
+    if (bank === 0) {
+        result.description = "Per-channel post-headamp meters + aux/fx/bus/matrix levels";
+        const lv: Record<string, number> = {};
+        for (let i = 0; i < 32; i++) {
+            const db = linToDbfs(floats[i]);
+            if (passLevel(db)) lv[`ch${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 8; i++) {
+            const db = linToDbfs(floats[32 + i]);
+            if (passLevel(db)) lv[`auxin${i + 1}`] = +db.toFixed(1);
+        }
+        const fxLabels = ["fxrtn1L", "fxrtn1R", "fxrtn2L", "fxrtn2R", "fxrtn3L", "fxrtn3R", "fxrtn4L", "fxrtn4R"];
+        for (let i = 0; i < 8; i++) {
+            const db = linToDbfs(floats[40 + i]);
+            if (passLevel(db)) lv[fxLabels[i]] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 16; i++) {
+            const db = linToDbfs(floats[48 + i]);
+            if (passLevel(db)) lv[`bus${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 6; i++) {
+            const db = linToDbfs(floats[64 + i]);
+            if (passLevel(db)) lv[`mtx${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        result.levels = lv;
+        return result;
+    }
+
+    if (bank === 1) {
+        result.description = "Post-fader channel levels + gate GR + dyn GR (32 channels each)";
+        const lv: Record<string, number> = {};
+        const gateGr: Record<string, number> = {};
+        const dynGr: Record<string, number> = {};
+        for (let i = 0; i < 32; i++) {
+            const db = linToDbfs(floats[i]);
+            if (passLevel(db)) lv[`ch${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 32; i++) {
+            const grDb = linToGrDb(floats[32 + i]);
+            if (passGr(grDb)) gateGr[`ch${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
+        }
+        for (let i = 0; i < 32; i++) {
+            const grDb = linToGrDb(floats[64 + i]);
+            if (passGr(grDb)) dynGr[`ch${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
+        }
+        result.levels = lv;
+        result.gateGainReduction = gateGr;
+        result.dynGainReduction = dynGr;
+        return result;
+    }
+
+    if (bank === 2) {
+        result.description = "Bus + matrix + main levels with their dyn GR";
+        const lv: Record<string, number> = {};
+        const dynGr: Record<string, number> = {};
+        for (let i = 0; i < 16; i++) {
+            const db = linToDbfs(floats[i]);
+            if (passLevel(db)) lv[`bus${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 6; i++) {
+            const db = linToDbfs(floats[16 + i]);
+            if (passLevel(db)) lv[`mtx${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+        }
+        const mainLeft = linToDbfs(floats[22]);
+        if (passLevel(mainLeft)) lv.mainL = +mainLeft.toFixed(1);
+        const mainRight = linToDbfs(floats[23]);
+        if (passLevel(mainRight)) lv.mainR = +mainRight.toFixed(1);
+        const mainMono = linToDbfs(floats[24]);
+        if (passLevel(mainMono)) lv.mainM = +mainMono.toFixed(1);
+
+        for (let i = 0; i < 16; i++) {
+            const grDb = linToGrDb(floats[25 + i]);
+            if (passGr(grDb)) dynGr[`bus${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
+        }
+        for (let i = 0; i < 6; i++) {
+            const grDb = linToGrDb(floats[41 + i]);
+            if (passGr(grDb)) dynGr[`mtx${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
+        }
+        const mainLrGr = linToGrDb(floats[47]);
+        if (passGr(mainLrGr)) dynGr.mainLR = +mainLrGr.toFixed(1);
+        const mainMonoGr = linToGrDb(floats[48]);
+        if (passGr(mainMonoGr)) dynGr.mainM = +mainMonoGr.toFixed(1);
+
+        result.levels = lv;
+        result.dynGainReduction = dynGr;
+        return result;
+    }
+
+    if (bank === 3) {
+        result.description = "Aux sends + aux returns + FX returns";
+        const lv: Record<string, number> = {};
+        for (let i = 0; i < 6; i++) {
+            const db = linToDbfs(floats[i]);
+            if (passLevel(db)) lv[`auxsnd${i + 1}`] = +db.toFixed(1);
+        }
+        for (let i = 0; i < 8; i++) {
+            const db = linToDbfs(floats[6 + i]);
+            if (passLevel(db)) lv[`auxin${i + 1}`] = +db.toFixed(1);
+        }
+        const fxLabels = ["fxrtn1L", "fxrtn1R", "fxrtn2L", "fxrtn2R", "fxrtn3L", "fxrtn3R", "fxrtn4L", "fxrtn4R"];
+        for (let i = 0; i < 8; i++) {
+            const db = linToDbfs(floats[14 + i]);
+            if (passLevel(db)) lv[fxLabels[i]] = +db.toFixed(1);
+        }
+        result.levels = lv;
+        return result;
+    }
+
+    return result;
+}
+
 // ========== GEQ band-name helpers (Phase D″) ==========
 // The fx-schema names GEQ band fields as `band_20Hz`, `band_31_5Hz`, ...,
 // `band_1k`, `band_1k25`, ..., `band_20k`. Dual variants prefix the side
@@ -807,6 +979,115 @@ export class OSCClient {
     /** Total number of FX algorithms in the schema. */
     fxAlgorithmCount(): number {
         return FX_ALGORITHM_COUNT;
+    }
+
+    // ========== Meter snapshot (Phase E) ==========
+
+    /**
+     * One-shot meter snapshot. Sends /meters with a bank tag, captures the FIRST
+     * binary blob reply from the mixer, and decodes it into a named-channel dict
+     * of dBfs values (or dB gain reduction for GR fields).
+     *
+     * The X32 actually treats /meters as a subscription — once requested, it
+     * streams updates every ~50ms for 10 seconds. We use a temporary dgram socket
+     * scoped to this snapshot so the streaming doesn't pollute the main rawSock
+     * queue, and close it after the first reply.
+     *
+     * Implemented banks:
+     *   - 0: per-channel post-headamp + auxes + FX returns + buses + matrices (70 floats)
+     *   - 1: post-fader levels + gate GR + dyn GR (96 floats)
+     *   - 2: bus + matrix + main + dyn GR for buses/matrices/mains (49 floats)
+     *   - 3: aux sends + aux returns + FX returns (22 floats)
+     *
+     * Filters out floats below `thresholdDb` (default -90 dBfs) — most "silent"
+     * channels noise-floor at ~-100 dBfs and pollute LLM context. Pass
+     * thresholdDb = -Infinity to keep everything.
+     */
+    async meterSnapshot(bank: number = 0, thresholdDb: number = -90): Promise<{
+        bank: number;
+        description: string;
+        elapsedMs: number;
+        floatCount: number;
+        levels?: Record<string, number>;
+        gateGainReduction?: Record<string, number>;
+        dynGainReduction?: Record<string, number>;
+    }> {
+        if (![0, 1, 2, 3].includes(bank)) {
+            throw new Error(`Meter bank ${bank} not implemented (valid: 0, 1, 2, 3). Banks 4..15 are RTA/specialty/console-VU and intentionally skipped.`);
+        }
+        const t0 = Date.now();
+        const floats = await this._readMeterBlob(bank, 1500);
+        const elapsedMs = Date.now() - t0;
+        return decodeMeterBlob(bank, floats, thresholdDb, elapsedMs);
+    }
+
+    /**
+     * Send /meters with bank tag, listen on a temporary dgram socket for the first
+     * /meters/N blob reply, return the decoded float array.
+     */
+    private _readMeterBlob(bank: number, timeoutMs: number): Promise<number[]> {
+        return new Promise((resolve, reject) => {
+            const sock = dgram.createSocket("udp4");
+            let settled = false;
+            const cleanup = () => {
+                try { sock.close(); } catch {}
+            };
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(new Error(`/meters/${bank} timeout after ${timeoutMs}ms — no blob reply`));
+            }, timeoutMs);
+
+            sock.on("message", (buf: Buffer) => {
+                if (settled) return;
+                try {
+                    const a = readCStringFrom(buf, 0);
+                    const t = readCStringFrom(buf, a.next);
+                    if (a.s !== `/meters/${bank}` || t.s !== ",b") return;
+                    const blobLen = buf.readInt32BE(t.next);
+                    const dataStart = t.next + 4;
+                    const numFloats = buf.readInt32LE(dataStart);
+                    if (numFloats < 0 || numFloats > 4096) {
+                        throw new Error(`Implausible numFloats ${numFloats} from /meters/${bank} (blobLen ${blobLen})`);
+                    }
+                    const out: number[] = [];
+                    for (let i = 0; i < numFloats; i++) {
+                        out.push(buf.readFloatLE(dataStart + 4 + i * 4));
+                    }
+                    settled = true;
+                    clearTimeout(timer);
+                    cleanup();
+                    resolve(out);
+                } catch (e) {
+                    settled = true;
+                    clearTimeout(timer);
+                    cleanup();
+                    reject(e);
+                }
+            });
+            sock.on("error", (e) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                cleanup();
+                reject(e);
+            });
+
+            sock.bind(0, "0.0.0.0", () => {
+                try {
+                    // OSC msg: /meters with args (string banktag) — single string is enough.
+                    const msg = buildMetersRequest(bank);
+                    sock.send(msg, this.port, this.host);
+                } catch (e) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    cleanup();
+                    reject(e);
+                }
+            });
+        });
     }
 
     // ========== Insert-effect surface (Phase D″) ==========
