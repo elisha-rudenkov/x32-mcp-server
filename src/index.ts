@@ -164,9 +164,10 @@ software or the console UI as the appropriate tool.
 
 ## Tool surface
 
-70 MCP tools, organized roughly:
+73 MCP tools, organized roughly:
 - **\`osc_capabilities\`** — this doc
 - **\`osc_identity\`** — model + firmware + IP + name in one call
+- **Discovery / connection (3)**: \`osc_discover_mixers\` (LAN broadcast scan), \`osc_connect\` (retarget without restart), \`osc_get_connection\` (current host/port)
 - **Schema-driven (3)**: \`osc_list_nodes\`, \`osc_node_get\`, \`osc_node_set\`
 - **Channel/strip composites**: \`osc_get_channel_strip\`, \`osc_get_bus_strip\`, etc.
 - **Scene snapshot / audit (2)**: \`osc_scene_snapshot\`, \`osc_scene_audit\`
@@ -873,6 +874,60 @@ const TOOLS: Tool[] = [
     {
         name: "osc_identity",
         description: "Get the mixer's identity: model, firmware version, IP address, hostname, and operational state. Wraps /xinfo and /status. Use this as the first call to confirm connectivity and version.",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    // ========== Discovery / connection ==========
+    {
+        name: "osc_discover_mixers",
+        description: "Scan the local network for X32/M32 mixers. Broadcasts /xinfo on UDP port 10023 across 255.255.255.255, each NIC's directed broadcast, and 127.0.0.1 (covers the local emulator), and returns every responder within the timeout window. Stateless — does not change which mixer the server is currently talking to; pair with osc_connect to retarget. Returns [] when nothing is found.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                port: {
+                    type: "number",
+                    description: "UDP port to broadcast on (default 10023, the X32 OSC port).",
+                    minimum: 1,
+                    maximum: 65535,
+                },
+                timeout_ms: {
+                    type: "number",
+                    description: "How long to listen for replies before returning (default 1500).",
+                    minimum: 200,
+                    maximum: 10000,
+                },
+            },
+        },
+    },
+    {
+        name: "osc_connect",
+        description: "Retarget the live OSC client at a specific mixer (host + optional port). Tears down the current connection and rebuilds against the new target, then optionally verifies by calling /xinfo. Use this after osc_discover_mixers to pick which mixer to control, or to connect to a known IP without env vars. Errors out if verification is requested and the mixer doesn't respond within 1.5s.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                host: {
+                    type: "string",
+                    description: "Mixer IP or hostname (e.g. '192.168.1.70').",
+                },
+                port: {
+                    type: "number",
+                    description: "OSC port (default 10023).",
+                    minimum: 1,
+                    maximum: 65535,
+                },
+                verify: {
+                    type: "boolean",
+                    description: "If true (default), issue /xinfo after reconnect and return the mixer identity. Set false to skip the round-trip (useful when the mixer isn't powered on yet but you want to preset the target).",
+                },
+            },
+            required: ["host"],
+        },
+    },
+    {
+        name: "osc_get_connection",
+        description: "Return the current OSC target (host, port, whether the local sockets are bound). Doesn't probe the mixer — use osc_identity to confirm reachability.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -1800,6 +1855,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const id = await osc.getIdentity();
                 return {
                     content: [{ type: "text", text: `Mixer identity:\n${JSON.stringify(id, null, 2)}` }],
+                };
+            }
+
+            case "osc_discover_mixers": {
+                const { port: scanPort, timeout_ms } = args as { port?: number; timeout_ms?: number };
+                const mixers = await OSCClient.discoverMixers(scanPort ?? 10023, timeout_ms ?? 1500);
+                const summary = mixers.length === 0
+                    ? "No mixers responded. Check that the mixer is powered on, on the same subnet, and that UDP 10023 isn't blocked by a firewall."
+                    : `Found ${mixers.length} mixer${mixers.length === 1 ? "" : "s"}.`;
+                return {
+                    content: [{
+                        type: "text",
+                        text: `${summary}\n${JSON.stringify(mixers, null, 2)}`,
+                    }],
+                };
+            }
+
+            case "osc_connect": {
+                const { host, port: connPort, verify } = args as { host: string; port?: number; verify?: boolean };
+                if (!host || typeof host !== "string") {
+                    throw new Error("osc_connect requires a 'host' string argument.");
+                }
+                const targetPort = connPort ?? 10023;
+                await osc.reconnect(host, targetPort);
+                const shouldVerify = verify !== false;
+                if (!shouldVerify) {
+                    return {
+                        content: [{ type: "text", text: `Retargeted to ${host}:${targetPort} (skipped /xinfo verification).` }],
+                    };
+                }
+                try {
+                    const id = await osc.getIdentity();
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Connected to ${host}:${targetPort}.\nMixer identity:\n${JSON.stringify(id, null, 2)}`,
+                        }],
+                    };
+                } catch (err) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Retargeted to ${host}:${targetPort} but /xinfo did not respond within 1s: ${err instanceof Error ? err.message : String(err)}. Mixer may be offline, on a different subnet, or behind a firewall.`,
+                        }],
+                        isError: true,
+                    };
+                }
+            }
+
+            case "osc_get_connection": {
+                const info = osc.getConnectionInfo();
+                return {
+                    content: [{ type: "text", text: `Current OSC target:\n${JSON.stringify(info, null, 2)}` }],
                 };
             }
 

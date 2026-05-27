@@ -1,5 +1,6 @@
 import OSC from "osc-js";
 import dgram from "dgram";
+import os from "os";
 import {
     NODE_SCHEMA,
     NodeSchemaEntry,
@@ -479,6 +480,68 @@ export function decodeOutputTapSource(n: number): string {
 
 type RawReply = { address: string; args: any[]; raw: string };
 
+export type DiscoveredMixer = {
+    ip: string;
+    name: string;
+    model: string;
+    firmware: string;
+    respondedFrom: string;
+};
+
+/** Build a raw OSC message with optional string args. Used for discovery (no live client needed). */
+function buildOscBytes(address: string, ...stringArgs: string[]): Buffer {
+    const padNul = (s: string): Buffer => {
+        const raw = Buffer.from(s + "\0");
+        const padded = Math.ceil(raw.length / 4) * 4;
+        return Buffer.concat([raw, Buffer.alloc(padded - raw.length)]);
+    };
+    const tag = "," + "s".repeat(stringArgs.length);
+    return Buffer.concat([padNul(address), padNul(tag), ...stringArgs.map(padNul)]);
+}
+
+/** Parse an X32 /xinfo reply (address + 4 string args: ip, name, model, firmware). */
+function parseXinfoReply(buf: Buffer): { ip: string; name: string; model: string; firmware: string } | null {
+    try {
+        const readCStr = (off: number) => {
+            let end = off;
+            while (end < buf.length && buf[end] !== 0) end++;
+            const s = buf.subarray(off, end).toString("utf8");
+            const padded = Math.ceil((end - off + 1) / 4) * 4;
+            return { s, next: off + padded };
+        };
+        const a = readCStr(0);
+        if (a.s !== "/xinfo") return null;
+        const t = readCStr(a.next);
+        if (!t.s.startsWith(",")) return null;
+        let off = t.next;
+        const strings: string[] = [];
+        for (let i = 1; i < t.s.length && i <= 4; i++) {
+            if (t.s[i] !== "s") return null;
+            const v = readCStr(off);
+            strings.push(v.s);
+            off = v.next;
+        }
+        if (strings.length < 4) return null;
+        return { ip: strings[0], name: strings[1], model: strings[2], firmware: strings[3] };
+    } catch {
+        return null;
+    }
+}
+
+/** Compute the directed broadcast address for an IPv4 address + netmask, e.g. ("192.168.1.5", "255.255.255.0") → "192.168.1.255". */
+function computeBroadcast(addr: string, mask: string): string | null {
+    const toInt = (s: string): number | null => {
+        const parts = s.split(".").map((p) => parseInt(p, 10));
+        if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) return null;
+        return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+    };
+    const a = toInt(addr);
+    const m = toInt(mask);
+    if (a === null || m === null) return null;
+    const b = ((a & m) | (~m >>> 0)) >>> 0;
+    return [(b >>> 24) & 0xff, (b >>> 16) & 0xff, (b >>> 8) & 0xff, b & 0xff].join(".");
+}
+
 export class OSCClient {
     private osc: any;
     private host: string;
@@ -500,38 +563,30 @@ export class OSCClient {
         timer: NodeJS.Timeout;
     } | null = null;
     private rawQueue: Array<() => void> = [];
+    private heartbeatTimer: NodeJS.Timeout | null = null;
 
     constructor(host: string, port: number) {
         this.host = host;
         this.port = port;
+        this._rebuildOscInstance();
+    }
 
-        // Create OSC instance with UDP plugin
+    /** (Re)build the osc-js instance pointing at the current host/port. The plugin captures
+     *  send target at construction, so changing host/port requires a fresh instance. */
+    private _rebuildOscInstance(): void {
         const plugin = new (OSC as any).DatagramPlugin({
-            open: {
-                host: "0.0.0.0",
-                port: 0,
-            },
-            send: {
-                host: this.host,
-                port: this.port,
-            },
+            open: { host: "0.0.0.0", port: 0 },
+            send: { host: this.host, port: this.port },
         });
-
-        this.osc = new (OSC as any)({
-            plugin: plugin,
-        });
-
-        // Handle incoming OSC messages
+        this.osc = new (OSC as any)({ plugin });
         this.osc.on("*", (message: any) => {
             const address = message.address;
             const callback = this.responseCallbacks.get(address);
-
             if (callback && message.args && message.args.length > 0) {
                 callback(message.args[0]);
                 this.responseCallbacks.delete(address);
             }
         });
-
         this.osc.on("error", (err: Error) => {
             console.error("OSC Error:", err);
         });
@@ -543,7 +598,7 @@ export class OSCClient {
         console.error("OSC UDP Port ready");
 
         this.sendCommand("/xremote");
-        setInterval(() => this.sendCommand("/xremote"), 9000);
+        this.heartbeatTimer = setInterval(() => this.sendCommand("/xremote"), 9000);
 
         this.rawSock = dgram.createSocket("udp4");
         this.rawSock.on("message", (buf) => this._handleRawReply(buf));
@@ -552,6 +607,95 @@ export class OSCClient {
             this.rawSock!.bind(0, "0.0.0.0", () => resolve());
         });
         console.error("Raw OSC socket bound on port", this.rawSock!.address().port);
+    }
+
+    /** Retarget the live client at a new mixer. rawSock stays bound (its dest is read at send time);
+     *  osc-js plugin captures its send target at construction so we rebuild that instance. */
+    async reconnect(host: string, port: number = 10023): Promise<void> {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+        try {
+            (this.osc as any)?.close?.();
+        } catch {
+            // osc-js close is best-effort
+        }
+        this.responseCallbacks.clear();
+        this.isConnected = false;
+
+        this.host = host;
+        this.port = port;
+
+        this._rebuildOscInstance();
+        this.osc.open({ host: "0.0.0.0", port: 0 });
+        this.isConnected = true;
+
+        this.sendCommand("/xremote");
+        this.heartbeatTimer = setInterval(() => this.sendCommand("/xremote"), 9000);
+
+        console.error(`OSC client retargeted to ${this.host}:${this.port}`);
+    }
+
+    /** Current connection target. Doesn't probe — pair with osc_identity to verify reachability. */
+    getConnectionInfo(): { host: string; port: number; connected: boolean } {
+        return { host: this.host, port: this.port, connected: this.isConnected };
+    }
+
+    /**
+     * Broadcast /xinfo on the local network and collect replies. Stateless — does not affect
+     * the live client. Sends to 255.255.255.255 + each NIC's directed broadcast + 127.0.0.1
+     * (covers emulator) and listens for `timeoutMs` ms before returning. Dedupes by reported IP.
+     */
+    static async discoverMixers(port: number = 10023, timeoutMs: number = 1500): Promise<DiscoveredMixer[]> {
+        return new Promise((resolve, reject) => {
+            const sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+            const found = new Map<string, DiscoveredMixer>();
+            let settled = false;
+            const done = (err?: Error) => {
+                if (settled) return;
+                settled = true;
+                try {
+                    sock.close();
+                } catch {
+                    // ignore — socket may already be closed
+                }
+                if (err) reject(err);
+                else resolve(Array.from(found.values()));
+            };
+
+            sock.on("error", (e) => done(e));
+            sock.on("message", (buf, rinfo) => {
+                const parsed = parseXinfoReply(buf);
+                if (!parsed) return;
+                const key = parsed.ip || rinfo.address;
+                if (found.has(key)) return;
+                found.set(key, { ...parsed, respondedFrom: rinfo.address });
+            });
+
+            sock.bind(0, "0.0.0.0", () => {
+                try {
+                    sock.setBroadcast(true);
+                } catch (e) {
+                    return done(e as Error);
+                }
+                const packet = buildOscBytes("/xinfo");
+                const targets = new Set<string>(["255.255.255.255", "127.0.0.1"]);
+                for (const ifaces of Object.values(os.networkInterfaces())) {
+                    for (const iface of ifaces ?? []) {
+                        if (iface.family !== "IPv4" || iface.internal) continue;
+                        const bcast = computeBroadcast(iface.address, iface.netmask);
+                        if (bcast) targets.add(bcast);
+                    }
+                }
+                for (const target of targets) {
+                    sock.send(packet, port, target, (err) => {
+                        if (err) console.error(`xinfo broadcast to ${target}:${port} failed: ${err.message}`);
+                    });
+                }
+                setTimeout(() => done(), timeoutMs);
+            });
+        });
     }
 
     private _handleRawReply(buf: Buffer): void {
