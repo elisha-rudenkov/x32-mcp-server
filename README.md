@@ -78,7 +78,7 @@ Example prompts that work out of the box:
 
 ## Capability highlights
 
-71 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
+39 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
 
 - **`osc_capabilities`** — single-call structured reference for the LLM. Anti-misconception oriented.
 - **Schema-driven reads/writes** — `osc_node_get` / `osc_node_set` / `osc_list_nodes` cover ~80 parameters per channel without per-feature tool sprawl. Atomic multi-field writes preserve untouched fields.
@@ -120,10 +120,10 @@ See `SPEC_COVERAGE.md` for the full catalog. Roughly:
 | Insert-effect (Phase D″) | 5 | `osc_find_geq_slots`, `osc_get_insert_state`, `osc_insert_eq_*` |
 | Meter snapshot (Phase E) | 1 | `osc_meter_snapshot` |
 | Comparison + copy (Phase F) | 3 | `osc_compare_channels/scenes`, `osc_copy_channel` |
-| Routing | 7 | `osc_get_routing_overview` (recommended), `osc_get/set_user_routing_*` |
-| Channel/bus/main controls | ~20 | Legacy direct setters: faders, pans, mutes, names |
+| Routing | 4 | `osc_get_routing_overview` (recommended), `osc_list_routing_sources`, `osc_set_user_routing_in/out` |
+| Composite strip reads | 1 | `osc_get_strip` (one tool for ch/bus/auxin/fxrtn/mtx/dca/main/mono) |
 | Custom escape hatch | 1 | `osc_custom_command` |
-| Other | ~20 | Effects (legacy), DCA, headamp, emulator |
+| Connection / scenes / emulator | 10 | `osc_connect`, `osc_get_connection`, `osc_discover_mixers`, `osc_open_x32_edit`, `osc_scene_recall/save`, `osc_get_scene_name`, emulator (start/stop/status) |
 
 ## Out of scope
 

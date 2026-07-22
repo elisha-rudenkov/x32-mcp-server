@@ -546,7 +546,9 @@ export class OSCClient {
     private osc: any;
     private host: string;
     private port: number;
-    private responseCallbacks: Map<string, (value: any) => void> = new Map();
+    // Queue-per-address so two concurrent reads of the same address don't clobber
+    // each other — replies are handed out FIFO to the waiters for that address.
+    private responseCallbacks: Map<string, Array<{ resolve: (value: any) => void; timer: NodeJS.Timeout }>> = new Map();
     private isConnected: boolean = false;
 
     // Parallel UDP socket for X32node traffic.
@@ -556,13 +558,25 @@ export class OSCClient {
     //   2. /xinfo replies carry 4 string args, but existing sendAndReceive only surfaces args[0].
     // This socket speaks raw OSC via a hand-rolled parser so we can see everything.
     private rawSock: dgram.Socket | null = null;
-    private rawInflight: {
-        matchAddr: (a: string) => boolean;
+    // Bounded pool of in-flight raw queries (was a single slot). Incoming packets are
+    // matched against these entries in FIFO order; the FIRST whose matcher accepts the
+    // packet is resolved. The matcher sees BOTH the reply address and the payload's
+    // path token so concurrent /node reads — which all reply on address "node" — are
+    // told apart by the path embedded in the reply body.
+    private rawInflight: Array<{
+        match: (address: string, payloadPath: string | null) => boolean;
         resolve: (r: RawReply) => void;
         reject: (e: Error) => void;
         timer: NodeJS.Timeout;
-    } | null = null;
+    }> = [];
+    // Pending fire() thunks queued when the in-flight pool is at capacity.
     private rawQueue: Array<() => void> = [];
+    // Max concurrent raw queries before further sends queue behind the pool.
+    private static readonly RAW_POOL_CAP = 8;
+    // Node paths that timed out after retry, ONLY for absent-by-design patterns
+    // (unassigned headamp slots, auxin automix containers). Fast-failed thereafter.
+    // Never holds arbitrary paths — a transient UDP drop must not poison a real node.
+    private negativeCache: Set<string> = new Set();
     private heartbeatTimer: NodeJS.Timeout | null = null;
 
     constructor(host: string, port: number) {
@@ -581,10 +595,12 @@ export class OSCClient {
         this.osc = new (OSC as any)({ plugin });
         this.osc.on("*", (message: any) => {
             const address = message.address;
-            const callback = this.responseCallbacks.get(address);
-            if (callback && message.args && message.args.length > 0) {
-                callback(message.args[0]);
-                this.responseCallbacks.delete(address);
+            const queue = this.responseCallbacks.get(address);
+            if (queue && queue.length > 0 && message.args && message.args.length > 0) {
+                const waiter = queue.shift()!;
+                clearTimeout(waiter.timer);
+                if (queue.length === 0) this.responseCallbacks.delete(address);
+                waiter.resolve(message.args[0]);
             }
         });
         this.osc.on("error", (err: Error) => {
@@ -622,6 +638,8 @@ export class OSCClient {
             // osc-js close is best-effort
         }
         this.responseCallbacks.clear();
+        // Negative cache is per-mixer — a slot absent on one console may exist on another.
+        this.negativeCache.clear();
         this.isConnected = false;
 
         this.host = host;
@@ -728,16 +746,30 @@ export class OSCClient {
                 else if (tag === "F") { args.push(false); }
                 else { break; }
             }
-            if (!this.rawInflight) return;
-            if (!this.rawInflight.matchAddr(a.s)) return;
-            const inflight = this.rawInflight;
-            this.rawInflight = null;
-            clearTimeout(inflight.timer);
-            inflight.resolve({ address: a.s, args, raw });
-            const next = this.rawQueue.shift();
-            if (next) next();
+            // Payload path token: X32 /node replies carry the queried path as the first
+            // string arg (e.g. '/ch/01/config "Voc1" 1 MG 1'), which is how concurrent
+            // /node reads — all addressed "node" — are matched back to their query.
+            const payloadPath = raw ? parseNodeLine(raw).path : null;
+            for (let i = 0; i < this.rawInflight.length; i++) {
+                const entry = this.rawInflight[i];
+                if (!entry.match(a.s, payloadPath)) continue;
+                this.rawInflight.splice(i, 1);
+                clearTimeout(entry.timer);
+                entry.resolve({ address: a.s, args, raw });
+                this._pumpRawQueue();
+                return;
+            }
+            // No matching in-flight entry — stray, duplicate, or streaming packet; ignore.
         } catch {
             // ignore malformed packets
+        }
+    }
+
+    /** Admit queued raw queries up to the pool cap. */
+    private _pumpRawQueue(): void {
+        while (this.rawInflight.length < OSCClient.RAW_POOL_CAP && this.rawQueue.length > 0) {
+            const fire = this.rawQueue.shift()!;
+            fire();
         }
     }
 
@@ -750,35 +782,54 @@ export class OSCClient {
 
     /**
      * Send a raw OSC message and wait for a matching reply on this.rawSock.
-     * Serialized — one in-flight at a time per client. Returns { address, args, raw }.
-     * @param matchAddr filter for the expected reply address (e.g. "node", "/xinfo").
+     * Concurrent — up to RAW_POOL_CAP queries may be in flight at once; the rest queue.
+     * Returns { address, args, raw }.
+     *
+     * @param match  predicate over (reply address, reply payload-path token). For /node
+     *   reads this checks BOTH address === "node" AND the payload path matches the queried
+     *   path, so concurrent /node reads (all addressed "node") never cross-match. For
+     *   non-node reads (/xinfo, /status, ...) the payload-path arg is simply ignored.
+     * @param timeoutMs per-attempt timeout (default 300ms). One automatic retry is made
+     *   on timeout, so total worst case ≈ 2 × timeoutMs before rejection.
      */
     private rawQuery(
         sendAddress: string,
         sendArgs: any[],
-        matchAddr: (a: string) => boolean,
-        timeoutMs: number = 1000,
+        match: (address: string, payloadPath: string | null) => boolean,
+        timeoutMs: number = 300,
     ): Promise<RawReply> {
         if (!this.rawSock) throw new Error("rawSock not initialized — call connect() first");
         return new Promise((resolve, reject) => {
+            const buf = this._buildOscMessage(sendAddress, ...sendArgs);
+            let attempt = 0;
+            const admit = () => {
+                if (this.rawInflight.length < OSCClient.RAW_POOL_CAP) fire();
+                else this.rawQueue.push(fire);
+            };
             const fire = () => {
-                const buf = this._buildOscMessage(sendAddress, ...sendArgs);
-                const timer = setTimeout(() => {
-                    if (this.rawInflight && this.rawInflight.resolve === resolve) {
-                        this.rawInflight = null;
-                        reject(new Error(`Timeout: ${sendAddress} ${JSON.stringify(sendArgs)}`));
-                        const next = this.rawQueue.shift();
-                        if (next) next();
-                    }
-                }, timeoutMs);
-                this.rawInflight = { matchAddr, resolve, reject, timer };
+                const entry = {
+                    match,
+                    resolve,
+                    reject,
+                    timer: setTimeout(() => onTimeout(entry), timeoutMs),
+                };
+                this.rawInflight.push(entry);
                 this.rawSock!.send(buf, this.port, this.host);
             };
-            if (this.rawInflight) {
-                this.rawQueue.push(fire);
-            } else {
-                fire();
-            }
+            const onTimeout = (entry: any) => {
+                const idx = this.rawInflight.indexOf(entry);
+                if (idx !== -1) this.rawInflight.splice(idx, 1);
+                if (attempt < 1) {
+                    // One automatic retry — on a LAN a real reply lands in single-digit ms,
+                    // so a miss is almost always transient UDP loss, not an absent node.
+                    attempt++;
+                    admit();
+                } else {
+                    reject(new Error(`Timeout: ${sendAddress} ${JSON.stringify(sendArgs)}`));
+                    this._pumpRawQueue();
+                }
+            };
+            admit();
         });
     }
 
@@ -796,10 +847,40 @@ export class OSCClient {
      */
     async nodeRead(path: string): Promise<{ path: string; raw: string; values: string[] }> {
         const clean = path.replace(/^\/+/, "");
-        const reply = await this.rawQuery("/node", [clean], (a) => a === "node");
-        const text = String(reply.args[0] ?? "");
-        const parsed = parseNodeLine(text);
-        return { path: parsed.path, raw: text, values: parsed.values };
+        if (this._isNegativeCacheable(clean) && this.negativeCache.has(clean)) {
+            throw new Error(`Node "${clean}" is negative-cached as absent (timed out after retry). Cleared on reconnect().`);
+        }
+        try {
+            // Match on address "node" AND the reply payload's path token, so concurrent
+            // /node reads (all replying on "node") are disambiguated by their path.
+            const reply = await this.rawQuery(
+                "/node",
+                [clean],
+                (address, payloadPath) =>
+                    address === "node" &&
+                    payloadPath !== null &&
+                    payloadPath.replace(/^\/+/, "") === clean,
+            );
+            const text = String(reply.args[0] ?? "");
+            const parsed = parseNodeLine(text);
+            return { path: parsed.path, raw: text, values: parsed.values };
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (this._isNegativeCacheable(clean) && /^Timeout:/.test(msg)) {
+                this.negativeCache.add(clean);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Whether a node path is eligible for negative caching. ONLY absent-by-design
+     * patterns qualify: unassigned headamp slots (headamp/NNN) and the auxin automix
+     * container (auxin/NN/automix) that times out on firmware 4.13. Every other path
+     * is excluded so a transient UDP drop can never poison a genuinely present node.
+     */
+    private _isNegativeCacheable(clean: string): boolean {
+        return /^headamp\/\d+$/.test(clean) || /^auxin\/\d+\/automix$/.test(clean);
     }
 
     /**
@@ -1104,7 +1185,7 @@ export class OSCClient {
 
         // Write the slot-class-correct integer to the leaf. (The X32 also accepts
         // /node-style writes with the symbolic name, but the leaf int is the
-        // documented path and matches what setEffectParam etc. already use.)
+        // documented path for FX type writes.)
         this.sendCommand(`/fx/${slot}/type`, [slotCode]);
         return {
             slot,
@@ -1920,19 +2001,30 @@ export class OSCClient {
         this.osc.send(message);
     }
 
-    private async sendAndReceive(address: string, args?: any[]): Promise<any> {
-        return new Promise((resolve, reject) => {
-            this.responseCallbacks.set(address, resolve);
-            this.sendCommand(address, args);
-
-            // Timeout after 1 second
-            setTimeout(() => {
-                if (this.responseCallbacks.has(address)) {
-                    this.responseCallbacks.delete(address);
-                    reject(new Error(`Timeout waiting for response from ${address}`));
+    private async sendAndReceive(address: string, args?: any[], timeoutMs: number = 300): Promise<any> {
+        // One send attempt: register a FIFO waiter for this address, fire, await reply.
+        const attemptOnce = (): Promise<any> => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                const q = this.responseCallbacks.get(address);
+                if (q) {
+                    const idx = q.findIndex((w) => w.timer === timer);
+                    if (idx !== -1) q.splice(idx, 1);
+                    if (q.length === 0) this.responseCallbacks.delete(address);
                 }
-            }, 1000);
+                reject(new Error(`Timeout waiting for response from ${address}`));
+            }, timeoutMs);
+            const waiter = { resolve, timer };
+            const q = this.responseCallbacks.get(address);
+            if (q) q.push(waiter);
+            else this.responseCallbacks.set(address, [waiter]);
+            this.sendCommand(address, args);
         });
+        try {
+            return await attemptOnce();
+        } catch {
+            // One automatic retry — a single dropped UDP datagram shouldn't fail the read.
+            return await attemptOnce();
+        }
     }
 
     private getChannelPath(channel: number): string {
@@ -1943,21 +2035,7 @@ export class OSCClient {
         return `/bus/${bus.toString().padStart(2, "0")}`;
     }
 
-    private getAuxPath(aux: number): string {
-        return `/aux/${aux.toString().padStart(2, "0")}`;
-    }
-
     // ========== Channel Controls ==========
-
-    async setFader(channel: number, level: number): Promise<void> {
-        const path = `${this.getChannelPath(channel)}/mix/fader`;
-        this.sendCommand(path, [level]);
-    }
-
-    async getFader(channel: number): Promise<number> {
-        const path = `${this.getChannelPath(channel)}/mix/fader`;
-        return await this.sendAndReceive(path);
-    }
 
     async muteChannel(channel: number, mute: boolean): Promise<void> {
         const path = `${this.getChannelPath(channel)}/mix/on`;
@@ -2191,57 +2269,6 @@ export class OSCClient {
         this.sendCommand(path, [on ? 1 : 0]);
     }
 
-    // ========== Bus Controls ==========
-
-    async setBusFader(bus: number, level: number): Promise<void> {
-        const path = `${this.getBusPath(bus)}/mix/fader`;
-        this.sendCommand(path, [level]);
-    }
-
-    async getBusFader(bus: number): Promise<number> {
-        const path = `${this.getBusPath(bus)}/mix/fader`;
-        return await this.sendAndReceive(path);
-    }
-
-    async muteBus(bus: number, mute: boolean): Promise<void> {
-        const path = `${this.getBusPath(bus)}/mix/on`;
-        this.sendCommand(path, [mute ? 0 : 1]);
-    }
-
-    async setBusPan(bus: number, pan: number): Promise<void> {
-        const path = `${this.getBusPath(bus)}/mix/pan`;
-        const mixerPan = (pan + 1) / 2;
-        this.sendCommand(path, [mixerPan]);
-    }
-
-    async setBusName(bus: number, name: string): Promise<void> {
-        const path = `${this.getBusPath(bus)}/config/name`;
-        this.sendCommand(path, [name]);
-    }
-
-    // ========== Aux Controls ==========
-
-    async setAuxFader(aux: number, level: number): Promise<void> {
-        const path = `${this.getAuxPath(aux)}/mix/fader`;
-        this.sendCommand(path, [level]);
-    }
-
-    async getAuxFader(aux: number): Promise<number> {
-        const path = `${this.getAuxPath(aux)}/mix/fader`;
-        return await this.sendAndReceive(path);
-    }
-
-    async muteAux(aux: number, mute: boolean): Promise<void> {
-        const path = `${this.getAuxPath(aux)}/mix/on`;
-        this.sendCommand(path, [mute ? 0 : 1]);
-    }
-
-    async setAuxPan(aux: number, pan: number): Promise<void> {
-        const path = `${this.getAuxPath(aux)}/mix/pan`;
-        const mixerPan = (pan + 1) / 2;
-        this.sendCommand(path, [mixerPan]);
-    }
-
     // ========== Sends ==========
 
     async sendToBus(channel: number, bus: number, level: number): Promise<void> {
@@ -2262,74 +2289,6 @@ export class OSCClient {
     async setSendPrePost(channel: number, bus: number, pre: boolean): Promise<void> {
         const path = `${this.getChannelPath(channel)}/mix/${bus.toString().padStart(2, "0")}/preamp`;
         this.sendCommand(path, [pre ? 1 : 0]);
-    }
-
-    // ========== Main Mix ==========
-
-    async setMainFader(level: number): Promise<void> {
-        this.sendCommand("/main/st/mix/fader", [level]);
-    }
-
-    async getMainFader(): Promise<number> {
-        return await this.sendAndReceive("/main/st/mix/fader");
-    }
-
-    async muteMain(mute: boolean): Promise<void> {
-        this.sendCommand("/main/st/mix/on", [mute ? 0 : 1]);
-    }
-
-    async setMainPan(pan: number): Promise<void> {
-        const path = "/main/st/mix/pan";
-        const mixerPan = (pan + 1) / 2;
-        this.sendCommand(path, [mixerPan]);
-    }
-
-    // ========== Matrix ==========
-
-    async setMatrixFader(matrix: number, level: number): Promise<void> {
-        const path = `/mtx/${matrix.toString().padStart(2, "0")}/mix/fader`;
-        this.sendCommand(path, [level]);
-    }
-
-    async muteMatrix(matrix: number, mute: boolean): Promise<void> {
-        const path = `/mtx/${matrix.toString().padStart(2, "0")}/mix/on`;
-        this.sendCommand(path, [mute ? 0 : 1]);
-    }
-
-    // ========== Effects ==========
-
-    private getFxPath(effect: number): string {
-        return `/fx/${effect}`;
-    }
-
-    async getEffectType(effect: number): Promise<number> {
-        return await this.sendAndReceive(`${this.getFxPath(effect)}/type`);
-    }
-
-    // NOTE: X32 has no /fx/N/on or /fx/N/mix addresses. FX slots are always
-    // instantiated; "on/off" is controlled by whether the FX return fader/mute
-    // is up, and wet/dry is an internal FX parameter (varies by algorithm).
-    // Use getFxReturnStrip() to check if an FX is effectively active.
-
-    async setEffectOn(effect: number, on: boolean): Promise<void> {
-        // Rewired: mute/unmute the corresponding FX return channel
-        const fxrPath = `/fxrtn/${effect.toString().padStart(2, "0")}/mix/on`;
-        this.sendCommand(fxrPath, [on ? 1 : 0]);
-    }
-
-    async getEffectOn(effect: number): Promise<boolean> {
-        // Rewired: read the FX return channel mute state
-        const fxrPath = `/fxrtn/${effect.toString().padStart(2, "0")}/mix/on`;
-        const value = await this.sendAndReceive(fxrPath);
-        return value === 1;
-    }
-
-    async setEffectParam(effect: number, param: number, value: number): Promise<void> {
-        this.sendCommand(`${this.getFxPath(effect)}/par/${param.toString().padStart(2, "0")}`, [value]);
-    }
-
-    async getEffectParam(effect: number, param: number): Promise<number> {
-        return await this.sendAndReceive(`${this.getFxPath(effect)}/par/${param.toString().padStart(2, "0")}`);
     }
 
     // ========== Routing ==========
@@ -2374,30 +2333,6 @@ export class OSCClient {
         return await this.sendAndReceive(path);
     }
 
-    // ========== Status ==========
-
-    async getMixerStatus(): Promise<any> {
-        try {
-            const info = await this.sendAndReceive("/info");
-            const status = await this.sendAndReceive("/status");
-
-            return {
-                connected: true,
-                host: this.host,
-                port: this.port,
-                info,
-                status,
-            };
-        } catch (error) {
-            return {
-                connected: false,
-                host: this.host,
-                port: this.port,
-                error: error instanceof Error ? error.message : String(error),
-            };
-        }
-    }
-
     // ========== Bulk Reads ==========
 
     private async safeRead(address: string): Promise<any> {
@@ -2405,17 +2340,20 @@ export class OSCClient {
     }
 
     private async readEQBands(path: string, bands: number = 4): Promise<any> {
-        const eqOn = await this.safeRead(`${path}/eq/on`);
-        const eq: any[] = [];
-        for (let b = 1; b <= bands; b++) {
-            eq.push({
-                band: b,
-                gain: await this.safeRead(`${path}/eq/${b}/g`),
-                freq: await this.safeRead(`${path}/eq/${b}/f`),
-                q: await this.safeRead(`${path}/eq/${b}/q`),
-                type: await this.safeRead(`${path}/eq/${b}/type`),
-            });
-        }
+        // Fire the on-flag and every band's four leaves concurrently through the pool.
+        const [eqOn, eq] = await Promise.all([
+            this.safeRead(`${path}/eq/on`),
+            Promise.all(Array.from({ length: bands }, async (_, i) => {
+                const b = i + 1;
+                const [gain, freq, q, type] = await Promise.all([
+                    this.safeRead(`${path}/eq/${b}/g`),
+                    this.safeRead(`${path}/eq/${b}/f`),
+                    this.safeRead(`${path}/eq/${b}/q`),
+                    this.safeRead(`${path}/eq/${b}/type`),
+                ]);
+                return { band: b, gain, freq, q, type };
+            })),
+        ]);
         return { eqOn: eqOn === 1, eq };
     }
 
@@ -2446,18 +2384,18 @@ export class OSCClient {
             try { return await this.nodeRead(path); } catch { return null; }
         };
 
-        const config = await readOrNull(`ch/${nn}/config`);
-        const mix = await readOrNull(`ch/${nn}/mix`);
-        const eqNode = await readOrNull(`ch/${nn}/eq`);
-        const eqBands: Array<{ values: string[] } | null> = [];
-        for (let b = 1; b <= 4; b++) eqBands.push(await readOrNull(`ch/${nn}/eq/${b}`));
-        const gate = await readOrNull(`ch/${nn}/gate`);
-        const dyn = await readOrNull(`ch/${nn}/dyn`);
-        const sends: Array<{ values: string[] } | null> = [];
-        for (let b = 1; b <= 16; b++) {
-            const bb = b.toString().padStart(2, "0");
-            sends.push(await readOrNull(`ch/${nn}/mix/${bb}`));
-        }
+        // All of these reads are independent — fire them concurrently through the
+        // pooled rawQuery instead of one strict round trip at a time.
+        const [config, mix, eqNode, gate, dyn, eqBands, sends] = await Promise.all([
+            readOrNull(`ch/${nn}/config`),
+            readOrNull(`ch/${nn}/mix`),
+            readOrNull(`ch/${nn}/eq`),
+            readOrNull(`ch/${nn}/gate`),
+            readOrNull(`ch/${nn}/dyn`),
+            Promise.all(Array.from({ length: 4 }, (_, i) => readOrNull(`ch/${nn}/eq/${i + 1}`))),
+            Promise.all(Array.from({ length: 16 }, (_, i) =>
+                readOrNull(`ch/${nn}/mix/${String(i + 1).padStart(2, "0")}`))),
+        ]);
 
         // config: [name, icon, color, source]
         result.name = config?.values[0] ?? null;
@@ -2522,20 +2460,27 @@ export class OSCClient {
         const path = this.getBusPath(bus);
         const result: any = { bus };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/mix/fader`);
-        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
-        result.pan = await this.safeRead(`${path}/mix/pan`);
-        result.color = await this.safeRead(`${path}/config/color`);
-
-        const eqData = await this.readEQBands(path, 4);
+        const [name, fader, on, pan, color, eqData, dynOn, dynThr, dynRatio] = await Promise.all([
+            this.safeRead(`${path}/config/name`),
+            this.safeRead(`${path}/mix/fader`),
+            this.safeRead(`${path}/mix/on`),
+            this.safeRead(`${path}/mix/pan`),
+            this.safeRead(`${path}/config/color`),
+            this.readEQBands(path, 4),
+            this.safeRead(`${path}/dyn/on`),
+            this.safeRead(`${path}/dyn/thr`),
+            this.safeRead(`${path}/dyn/ratio`),
+        ]);
+        result.name = name;
+        result.fader = fader;
+        result.on = on === 1;
+        result.pan = pan;
+        result.color = color;
         result.eqOn = eqData.eqOn;
         result.eq = eqData.eq;
-
-        // Dynamics
-        result.dynOn = (await this.safeRead(`${path}/dyn/on`)) === 1;
-        result.dynThr = await this.safeRead(`${path}/dyn/thr`);
-        result.dynRatio = await this.safeRead(`${path}/dyn/ratio`);
+        result.dynOn = dynOn === 1;
+        result.dynThr = dynThr;
+        result.dynRatio = dynRatio;
 
         return result;
     }
@@ -2544,12 +2489,20 @@ export class OSCClient {
         const path = `/auxin/${aux.toString().padStart(2, "0")}`;
         const result: any = { aux };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/mix/fader`);
-        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
-        result.pan = await this.safeRead(`${path}/mix/pan`);
-        result.color = await this.safeRead(`${path}/config/color`);
-        result.source = await this.safeRead(`${path}/config/source`);
+        const [name, fader, on, pan, color, source] = await Promise.all([
+            this.safeRead(`${path}/config/name`),
+            this.safeRead(`${path}/mix/fader`),
+            this.safeRead(`${path}/mix/on`),
+            this.safeRead(`${path}/mix/pan`),
+            this.safeRead(`${path}/config/color`),
+            this.safeRead(`${path}/config/source`),
+        ]);
+        result.name = name;
+        result.fader = fader;
+        result.on = on === 1;
+        result.pan = pan;
+        result.color = color;
+        result.source = source;
 
         return result;
     }
@@ -2558,11 +2511,18 @@ export class OSCClient {
         const path = `/fxrtn/${fxr.toString().padStart(2, "0")}`;
         const result: any = { fxReturn: fxr };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/mix/fader`);
-        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
-        result.pan = await this.safeRead(`${path}/mix/pan`);
-        result.color = await this.safeRead(`${path}/config/color`);
+        const [name, fader, on, pan, color] = await Promise.all([
+            this.safeRead(`${path}/config/name`),
+            this.safeRead(`${path}/mix/fader`),
+            this.safeRead(`${path}/mix/on`),
+            this.safeRead(`${path}/mix/pan`),
+            this.safeRead(`${path}/config/color`),
+        ]);
+        result.name = name;
+        result.fader = fader;
+        result.on = on === 1;
+        result.pan = pan;
+        result.color = color;
 
         return result;
     }
@@ -2571,12 +2531,17 @@ export class OSCClient {
         const path = `/mtx/${mtx.toString().padStart(2, "0")}`;
         const result: any = { matrix: mtx };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/mix/fader`);
-        result.on = (await this.safeRead(`${path}/mix/on`)) === 1;
-        result.pan = await this.safeRead(`${path}/mix/pan`);
-
-        const eqData = await this.readEQBands(path, 4);
+        const [name, fader, on, pan, eqData] = await Promise.all([
+            this.safeRead(`${path}/config/name`),
+            this.safeRead(`${path}/mix/fader`),
+            this.safeRead(`${path}/mix/on`),
+            this.safeRead(`${path}/mix/pan`),
+            this.readEQBands(path, 4),
+        ]);
+        result.name = name;
+        result.fader = fader;
+        result.on = on === 1;
+        result.pan = pan;
         result.eqOn = eqData.eqOn;
         result.eq = eqData.eq;
 
@@ -2587,10 +2552,16 @@ export class OSCClient {
         const path = `/dca/${dca}`;
         const result: any = { dca };
 
-        result.name = await this.safeRead(`${path}/config/name`);
-        result.fader = await this.safeRead(`${path}/fader`);
-        result.on = (await this.safeRead(`${path}/on`)) === 1;
-        result.color = await this.safeRead(`${path}/config/color`);
+        const [name, fader, on, color] = await Promise.all([
+            this.safeRead(`${path}/config/name`),
+            this.safeRead(`${path}/fader`),
+            this.safeRead(`${path}/on`),
+            this.safeRead(`${path}/config/color`),
+        ]);
+        result.name = name;
+        result.fader = fader;
+        result.on = on === 1;
+        result.color = color;
 
         return result;
     }
@@ -2598,23 +2569,28 @@ export class OSCClient {
     async getMainStrip(): Promise<any> {
         const result: any = { type: "main_stereo" };
 
-        result.fader = await this.safeRead("/main/st/mix/fader");
-        result.on = (await this.safeRead("/main/st/mix/on")) === 1;
-        result.pan = await this.safeRead("/main/st/mix/pan");
-
-        const eqData = await this.readEQBands("/main/st", 6);
+        const [fader, on, pan, eqData, dynOn, dynThr, dynRatio, monoFader, monoOn] = await Promise.all([
+            this.safeRead("/main/st/mix/fader"),
+            this.safeRead("/main/st/mix/on"),
+            this.safeRead("/main/st/mix/pan"),
+            this.readEQBands("/main/st", 6),
+            this.safeRead("/main/st/dyn/on"),
+            this.safeRead("/main/st/dyn/thr"),
+            this.safeRead("/main/st/dyn/ratio"),
+            this.safeRead("/main/m/mix/fader"),
+            this.safeRead("/main/m/mix/on"),
+        ]);
+        result.fader = fader;
+        result.on = on === 1;
+        result.pan = pan;
         result.eqOn = eqData.eqOn;
         result.eq = eqData.eq;
-
-        // Dynamics
-        result.dynOn = (await this.safeRead("/main/st/dyn/on")) === 1;
-        result.dynThr = await this.safeRead("/main/st/dyn/thr");
-        result.dynRatio = await this.safeRead("/main/st/dyn/ratio");
-
-        // Mono bus
+        result.dynOn = dynOn === 1;
+        result.dynThr = dynThr;
+        result.dynRatio = dynRatio;
         result.mono = {
-            fader: await this.safeRead("/main/m/mix/fader"),
-            on: (await this.safeRead("/main/m/mix/on")) === 1,
+            fader: monoFader,
+            on: monoOn === 1,
         };
 
         return result;
@@ -2629,95 +2605,95 @@ export class OSCClient {
         };
     }
 
+    /**
+     * High-level console overview. Rewritten to read each strip's name + on/fader from
+     * two /node container reads (config → name; mix → on + fader) instead of three
+     * single-leaf reads per strip, and to issue every read concurrently through the
+     * pooled rawQuery. ~62 strips × 3 serial leaf reads (~190 round trips) collapse to
+     * ~124 concurrent /node reads.
+     *
+     * SEMANTIC CHANGE — fader units: the old single-leaf `/…/mix/fader` reads returned a
+     * 0..1 LINEAR float. The /node `mix` container reports fader as a dB string, decoded
+     * here via parseX32Db. dB cannot be converted back to the old linear scale cleanly,
+     * so the key is renamed `fader` → `faderDb` (and `monoFader` → `monoFaderDb`) to make
+     * the unit change explicit and prevent any consumer from silently misreading it.
+     * index.ts only JSON-stringifies this object, so no caller edits are required.
+     */
     async getConsoleOverview(): Promise<any> {
+        const readOrNull = async (p: string): Promise<{ values: string[] } | null> => {
+            try { return await this.nodeRead(p); } catch { return null; }
+        };
+        const name = (n: { values: string[] } | null): string | null => n?.values[0] ?? null;
+        // mix / dca containers: values[0]=on (ON/OFF), values[1]=fader (dB).
+        const faderDb = (n: { values: string[] } | null): number | null =>
+            n && n.values[1] !== undefined ? parseX32Db(n.values[1]) : null;
+        const on = (n: { values: string[] } | null): boolean | null =>
+            n ? parseX32Bool(n.values[0]) : null;
+
+        // A per-strip pair reader: [config, mix] concurrently.
+        const stripPair = (cfgPath: string, mixPath: string) =>
+            Promise.all([readOrNull(cfgPath), readOrNull(mixPath)]);
+
+        // Fire EVERY read across all strip groups concurrently; the pool caps at
+        // RAW_POOL_CAP in flight and queues the rest.
+        const [
+            chPairs, busPairs, dcaPairs, mtxPairs, auxPairs, fxrPairs,
+            fxTypes, mainStMix, mainMMix,
+        ] = await Promise.all([
+            Promise.all(Array.from({ length: 32 }, (_, i) => {
+                const nn = String(i + 1).padStart(2, "0");
+                return stripPair(`ch/${nn}/config`, `ch/${nn}/mix`);
+            })),
+            Promise.all(Array.from({ length: 16 }, (_, i) => {
+                const nn = String(i + 1).padStart(2, "0");
+                return stripPair(`bus/${nn}/config`, `bus/${nn}/mix`);
+            })),
+            // DCA master state lives at dca/N (on, fader); its name at dca/N/config.
+            Promise.all(Array.from({ length: 8 }, (_, i) =>
+                stripPair(`dca/${i + 1}/config`, `dca/${i + 1}`))),
+            Promise.all(Array.from({ length: 6 }, (_, i) => {
+                const nn = String(i + 1).padStart(2, "0");
+                return stripPair(`mtx/${nn}/config`, `mtx/${nn}/mix`);
+            })),
+            Promise.all(Array.from({ length: 8 }, (_, i) => {
+                const nn = String(i + 1).padStart(2, "0");
+                return stripPair(`auxin/${nn}/config`, `auxin/${nn}/mix`);
+            })),
+            Promise.all(Array.from({ length: 8 }, (_, i) => {
+                const nn = String(i + 1).padStart(2, "0");
+                return stripPair(`fxrtn/${nn}/config`, `fxrtn/${nn}/mix`);
+            })),
+            // FX slot type unchanged: leaf read returns the raw int type code.
+            Promise.all(Array.from({ length: 8 }, (_, i) => this.safeRead(`/fx/${i + 1}/type`))),
+            readOrNull("main/st/mix"),
+            readOrNull("main/m/mix"),
+        ]);
+
         const overview: any = {};
-
-        // All 32 channels - name, fader, mute only for speed
-        overview.channels = [];
-        for (let ch = 1; ch <= 32; ch++) {
-            const path = this.getChannelPath(ch);
-            overview.channels.push({
-                ch,
-                name: await this.safeRead(`${path}/config/name`),
-                fader: await this.safeRead(`${path}/mix/fader`),
-                on: (await this.safeRead(`${path}/mix/on`)) === 1,
-            });
-        }
-
-        // 16 mix buses
-        overview.buses = [];
-        for (let b = 1; b <= 16; b++) {
-            const path = this.getBusPath(b);
-            overview.buses.push({
-                bus: b,
-                name: await this.safeRead(`${path}/config/name`),
-                fader: await this.safeRead(`${path}/mix/fader`),
-                on: (await this.safeRead(`${path}/mix/on`)) === 1,
-            });
-        }
-
-        // 8 DCA groups
-        overview.dcas = [];
-        for (let d = 1; d <= 8; d++) {
-            overview.dcas.push({
-                dca: d,
-                name: await this.safeRead(`/dca/${d}/config/name`),
-                fader: await this.safeRead(`/dca/${d}/fader`),
-                on: (await this.safeRead(`/dca/${d}/on`)) === 1,
-            });
-        }
-
-        // 6 matrices
-        overview.matrices = [];
-        for (let m = 1; m <= 6; m++) {
-            const path = `/mtx/${m.toString().padStart(2, "0")}`;
-            overview.matrices.push({
-                matrix: m,
-                name: await this.safeRead(`${path}/config/name`),
-                fader: await this.safeRead(`${path}/mix/fader`),
-                on: (await this.safeRead(`${path}/mix/on`)) === 1,
-            });
-        }
-
-        // 8 aux inputs
-        overview.auxInputs = [];
-        for (let a = 1; a <= 8; a++) {
-            const path = `/auxin/${a.toString().padStart(2, "0")}`;
-            overview.auxInputs.push({
-                aux: a,
-                name: await this.safeRead(`${path}/config/name`),
-                fader: await this.safeRead(`${path}/mix/fader`),
-                on: (await this.safeRead(`${path}/mix/on`)) === 1,
-            });
-        }
-
-        // 8 FX returns
-        overview.fxReturns = [];
-        for (let f = 1; f <= 8; f++) {
-            const path = `/fxrtn/${f.toString().padStart(2, "0")}`;
-            overview.fxReturns.push({
-                fxReturn: f,
-                name: await this.safeRead(`${path}/config/name`),
-                fader: await this.safeRead(`${path}/mix/fader`),
-                on: (await this.safeRead(`${path}/mix/on`)) === 1,
-            });
-        }
-
-        // 8 FX slots
-        overview.fxSlots = [];
-        for (let fx = 1; fx <= 8; fx++) {
-            overview.fxSlots.push({
-                slot: fx,
-                type: await this.safeRead(`/fx/${fx}/type`),
-            });
-        }
-
-        // Main
+        overview.channels = chPairs.map(([cfg, mix], i) => ({
+            ch: i + 1, name: name(cfg), faderDb: faderDb(mix), on: on(mix),
+        }));
+        overview.buses = busPairs.map(([cfg, mix], i) => ({
+            bus: i + 1, name: name(cfg), faderDb: faderDb(mix), on: on(mix),
+        }));
+        overview.dcas = dcaPairs.map(([cfg, dca], i) => ({
+            dca: i + 1, name: name(cfg), faderDb: faderDb(dca), on: on(dca),
+        }));
+        overview.matrices = mtxPairs.map(([cfg, mix], i) => ({
+            matrix: i + 1, name: name(cfg), faderDb: faderDb(mix), on: on(mix),
+        }));
+        overview.auxInputs = auxPairs.map(([cfg, mix], i) => ({
+            aux: i + 1, name: name(cfg), faderDb: faderDb(mix), on: on(mix),
+        }));
+        overview.fxReturns = fxrPairs.map(([cfg, mix], i) => ({
+            fxReturn: i + 1, name: name(cfg), faderDb: faderDb(mix), on: on(mix),
+        }));
+        overview.fxSlots = fxTypes.map((type, i) => ({ slot: i + 1, type }));
         overview.main = {
-            fader: await this.safeRead("/main/st/mix/fader"),
-            on: (await this.safeRead("/main/st/mix/on")) === 1,
-            monoFader: await this.safeRead("/main/m/mix/fader"),
-            monoOn: (await this.safeRead("/main/m/mix/on")) === 1,
+            faderDb: faderDb(mainStMix),
+            on: on(mainStMix),
+            monoFaderDb: faderDb(mainMMix),
+            monoOn: on(mainMMix),
         };
 
         return overview;
@@ -2808,27 +2784,22 @@ export class OSCClient {
     }
 
     async getUserRouting(): Promise<any> {
-        const userRouting: any = { userIn: [], userOut: [] };
+        // All 32 + 48 slot reads are independent — issue them concurrently through the
+        // pool. map() preserves slot order in the result arrays.
+        const [userIn, userOut] = await Promise.all([
+            Promise.all(Array.from({ length: 32 }, async (_, i) => {
+                const slot = i + 1;
+                const source = await this.safeRead(`/config/userrout/in/${slot.toString().padStart(2, "0")}`);
+                return { slot, source, sourceLabel: source === null ? null : decodeUserInSource(source) };
+            })),
+            Promise.all(Array.from({ length: 48 }, async (_, i) => {
+                const slot = i + 1;
+                const source = await this.safeRead(`/config/userrout/out/${slot.toString().padStart(2, "0")}`);
+                return { slot, source, sourceLabel: source === null ? null : decodeUserOutSource(source) };
+            })),
+        ]);
 
-        for (let slot = 1; slot <= 32; slot++) {
-            const source = await this.safeRead(`/config/userrout/in/${slot.toString().padStart(2, "0")}`);
-            userRouting.userIn.push({
-                slot,
-                source,
-                sourceLabel: source === null ? null : decodeUserInSource(source),
-            });
-        }
-
-        for (let slot = 1; slot <= 48; slot++) {
-            const source = await this.safeRead(`/config/userrout/out/${slot.toString().padStart(2, "0")}`);
-            userRouting.userOut.push({
-                slot,
-                source,
-                sourceLabel: source === null ? null : decodeUserOutSource(source),
-            });
-        }
-
-        return userRouting;
+        return { userIn, userOut };
     }
 
     /**
@@ -2840,73 +2811,9 @@ export class OSCClient {
         this.sendCommand(path, [code]);
     }
 
-    async getUserRoutingIn(slot: number): Promise<{ source: number; sourceLabel: string }> {
-        const path = `/config/userrout/in/${slot.toString().padStart(2, "0")}`;
-        const source = await this.sendAndReceive(path);
-        return { source, sourceLabel: decodeUserInSource(source) };
-    }
-
     async setUserRoutingOut(slot: number, source: number): Promise<void> {
         const path = `/config/userrout/out/${slot.toString().padStart(2, "0")}`;
         this.sendCommand(path, [source]);
-    }
-
-    async getUserRoutingOut(slot: number): Promise<{ source: number; sourceLabel: string }> {
-        const path = `/config/userrout/out/${slot.toString().padStart(2, "0")}`;
-        const source = await this.sendAndReceive(path);
-        return { source, sourceLabel: decodeUserOutSource(source) };
-    }
-
-    async getFullFxChain(): Promise<any[]> {
-        // For each FX slot: type, source assignment, params, and FX return state
-        const chains: any[] = [];
-        for (let fx = 1; fx <= 8; fx++) {
-            const chain: any = { slot: fx };
-
-            // FX type and params
-            chain.type = await this.safeRead(`/fx/${fx}/type`);
-            chain.params = [];
-            for (let p = 1; p <= 16; p++) {
-                const val = await this.safeRead(`/fx/${fx}/par/${p.toString().padStart(2, "0")}`);
-                if (val !== null) chain.params.push({ param: p, value: val });
-            }
-
-            // Source assignment
-            if (fx <= 4) {
-                chain.sourceL = await this.safeRead(`/fx/${fx}/source/l`);
-                chain.sourceR = await this.safeRead(`/fx/${fx}/source/r`);
-            } else {
-                chain.source = await this.safeRead(`/fx/${fx}/source`);
-            }
-
-            // FX return state
-            const fxrPath = `/fxrtn/${fx.toString().padStart(2, "0")}`;
-            chain.returnFader = await this.safeRead(`${fxrPath}/mix/fader`);
-            chain.returnOn = (await this.safeRead(`${fxrPath}/mix/on`)) === 1;
-            chain.returnName = await this.safeRead(`${fxrPath}/config/name`);
-
-            chains.push(chain);
-        }
-        return chains;
-    }
-
-    async getAllEffects(): Promise<any[]> {
-        const effects: any[] = [];
-        for (let fx = 1; fx <= 8; fx++) {
-            const slot: any = { slot: fx };
-            try { slot.type = await this.getEffectType(fx); } catch { slot.type = null; }
-            slot.params = [];
-            for (let p = 1; p <= 8; p++) {
-                try {
-                    const val = await this.getEffectParam(fx, p);
-                    slot.params.push({ param: p, value: val });
-                } catch {
-                    slot.params.push({ param: p, value: null });
-                }
-            }
-            effects.push(slot);
-        }
-        return effects;
     }
 
     // ========== Custom Commands ==========

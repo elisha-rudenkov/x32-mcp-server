@@ -1283,6 +1283,60 @@ export function listFxAlgorithms(filter?: string): FxAlgorithmEntry[] {
     );
 }
 
+/**
+ * Compact, size-capped view of the FX algorithm schema for LLM consumption.
+ *
+ * - "names": algorithm names grouped by slot-class validity (stereo 1..4 / insert 5..8).
+ * - "summary" (default): per-algorithm {name, stereoCode, insertCode, validOnInsert,
+ *   paramCount, desc(<=60 chars)} — NO per-param schema. Stays small (~3-4KB).
+ * - "full": complete entry (incl. param schema) for ONE named algorithm; requires `algorithm`.
+ */
+export function summarizeFxAlgorithms(
+    detail: "names" | "summary" | "full" = "summary",
+    algorithm?: string,
+): any {
+    if (detail === "full") {
+        if (!algorithm) {
+            throw new Error(
+                'detail "full" requires an `algorithm` name (e.g. "HALL"). Use detail "names" or "summary" first to discover algorithm names.',
+            );
+        }
+        const entry = findFxByName(algorithm);
+        if (!entry) {
+            throw new Error(`Unknown FX algorithm "${algorithm}". Use detail "names" to list valid names.`);
+        }
+        const insertCode = FX5_TO_8_BY_NAME.get(entry.name);
+        return {
+            ...entry,
+            stereoCode: entry.slots.stereo ? entry.code : null,
+            insertCode: insertCode === undefined ? null : insertCode,
+        };
+    }
+    if (detail === "names") {
+        return {
+            count: FX_ALGORITHM_SCHEMA.length,
+            stereoSlots1to4: FX_ALGORITHM_SCHEMA.filter((e) => e.slots.stereo).map((e) => e.name),
+            insertSlots5to8: FX_ALGORITHM_SCHEMA.filter((e) => e.slots.insert).map((e) => e.name),
+        };
+    }
+    // "summary" (default)
+    return {
+        count: FX_ALGORITHM_SCHEMA.length,
+        note: 'Slots 1..4 use stereoCode, slots 5..8 use insertCode (present only where applicable). validOnInsert = usable on slots 5..8. Call detail:"full" with an algorithm name for its param schema.',
+        algorithms: FX_ALGORITHM_SCHEMA.map((e) => {
+            const insertCode = FX5_TO_8_BY_NAME.get(e.name);
+            const o: any = { name: e.name };
+            if (e.slots.stereo) o.stereoCode = e.code;
+            if (insertCode !== undefined) o.insertCode = insertCode;
+            o.validOnInsert = e.slots.insert;
+            o.paramCount = e.params.length;
+            const d = (e.description || "").slice(0, 60);
+            if (d) o.desc = d;
+            return o;
+        }),
+    };
+}
+
 /** Names of algorithms suitable for insert slots (5..8). */
 export const FX_INSERT_ALGORITHM_NAMES: string[] = [...FX5_TO_8_BY_CODE];
 
