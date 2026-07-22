@@ -104,9 +104,18 @@ Use \`osc_list_nodes\` to discover what's available for any path pattern. \`osc_
 reads typed values; \`osc_node_set\` writes. This replaces hand-wrapping individual
 setters for every parameter.
 
-### One-shot meter snapshot (not streaming)
-\`osc_meter_snapshot({bank})\` returns dB values for all channels in ~50ms. Banks 0/1/2/3
-implemented. Pair with \`osc_trace_signal\` to debug "no signal at ch N".
+### Metering: snapshot for "is there signal", watch for "is it clipping / how hot over time"
+- \`osc_meter_snapshot({bank})\` returns dB values for all channels in ONE ~50ms frame — the
+  fast "is there signal at all?" probe. Pair with \`osc_trace_signal\` to debug "no signal at ch N".
+- \`osc_meter_watch({bank, seconds, threshold_db})\` **blocks for \`seconds\`** (default 3, clamped
+  0.5-10) sampling that bank ~20x/sec, then returns per-key statistics: \`peakDb\`, \`avgDb\`,
+  \`clipPct\` (% of frames above -0.5 dBFS), \`activePct\` (% of frames at/above threshold). On banks
+  1/2 it also returns \`gateGainReduction\` / \`dynGainReduction\` (\`maxReductionDb\`, \`avgReductionDb\`,
+  \`activePct\`). A \`flags\` array raises **heuristic** hints (not reliable detection): \`clipping\`
+  (key clips in >1% of frames) and \`sustained\` (level parked in a 3 dB band above -30 dBFS for
+  >90% of frames — a cheap feedback / stuck-signal cue). Use this for "is ch 5 clipping?",
+  "how hot is the main over the chorus?", "is the comp actually working?".
+Both filter aggressively: keys below threshold (levels) or never reducing (GR) are omitted.
 
 ### Live state mirror — reads are cache-accelerated with live invalidation
 After connecting, the server keeps a \`/xremote\` subscription alive, so the console pushes
@@ -147,6 +156,15 @@ group memberships by default. Override with \`includeConfig\`/\`includeGroups\` 
 1. \`osc_trace_signal({channel: 5})\` — full signal-flow tree
 2. \`osc_meter_snapshot({bank: 0})\` — confirm signal at the input
 3. Fix via \`osc_node_set\` if mute/routing is wrong
+
+### "Why is ch N distorting?"
+1. \`osc_meter_watch({bank: 0, seconds: 5})\` — is the INPUT hot? A \`clipping\` flag on ch N (or
+   \`clipPct\` > 0) means the source is overdriving the preamp — lower the headamp gain (\`/headamp\`)
+   or the digital trim, not the fader.
+2. \`osc_meter_watch({bank: 1, seconds: 5})\` — bank 1 adds post-fader level **and** gate/dyn gain
+   reduction per channel. Heavy \`dynGainReduction\` on ch N (high \`maxReductionDb\`, \`activePct\` near
+   100) means the compressor is slamming it; a \`sustained\` flag hints at feedback. Fix the comp
+   threshold/ratio via \`osc_node_set("/ch/NN/dyn", {...})\` or back off the input.
 
 ### "Audit my scene"
 1. \`osc_scene_snapshot()\` — one-shot snapshot (~1.7s, ~700 fields)
@@ -231,7 +249,7 @@ Use \`osc_list_nodes("ch/*/mix")\` etc. to discover exact field names for any co
 
 ## Tool surface
 
-43 MCP tools:
+44 MCP tools:
 - **\`osc_capabilities\`** — this doc; **\`osc_identity\`** — model + firmware + IP + name
 - **Discovery / connection (3)**: \`osc_discover_mixers\`, \`osc_connect\`, \`osc_get_connection\` (also reports cache stats)
 - **Live state (1)**: \`osc_changes\` — deduped feed of console-side parameter changes
@@ -242,7 +260,7 @@ Use \`osc_list_nodes("ch/*/mix")\` etc. to discover exact field names for any co
 - **Signal-flow diagnostics (2)**: \`osc_trace_signal\`, \`osc_find_routing\`
 - **FX (4)**: \`osc_fx_get\`, \`osc_fx_set\`, \`osc_fx_set_type\`, \`osc_fx_list_algorithms\` (\`detail\` levels)
 - **Insert-EQ (5)**: \`osc_find_geq_slots\`, \`osc_get_insert_state\`, \`osc_insert_eq_get/set/reset\`
-- **Meter (1)**: \`osc_meter_snapshot\`
+- **Meter (2)**: \`osc_meter_snapshot\` (one frame), \`osc_meter_watch\` (windowed stats + flags)
 - **Comparison + copy (3)**: \`osc_compare_channels\`, \`osc_compare_scenes\`, \`osc_copy_channel\`
 - **Routing (4)**: \`osc_get_routing_overview\` (recommended), \`osc_set_user_routing_in\`, \`osc_set_user_routing_out\`, \`osc_list_routing_sources\`
 - **Scenes (3)**: \`osc_scene_recall\`, \`osc_scene_save\`, \`osc_get_scene_name\`
@@ -612,6 +630,19 @@ const TOOLS: Tool[] = [
             properties: {
                 bank: { type: "number", description: "Meter bank 0-3 (default 0).", enum: [0, 1, 2, 3] },
                 threshold_db: { type: "number", description: "dBfs threshold; level meters below are omitted (default -90)." },
+            },
+        },
+    },
+    {
+        name: "osc_meter_watch",
+        description:
+            "BLOCKS for `seconds` (default 3, clamped 0.5-10) while sampling a meter bank ~20x/sec, then returns per-key peak/avg/clip/active stats + gate/dyn gain-reduction stats + heuristic clipping/sustained flags. Use for \"is it clipping / how hot over time\"; use osc_meter_snapshot for a single \"is there signal\" frame.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                bank: { type: "number", description: "Meter bank 0-3 (default 0). 0 per-channel input, 1 post-fader + gate/dyn GR, 2 bus/matrix/main + GR, 3 aux/fx.", enum: [0, 1, 2, 3] },
+                seconds: { type: "number", description: "Window length in seconds, clamped to [0.5, 10] (default 3). The call blocks for this long." },
+                threshold_db: { type: "number", description: "dBfs threshold; level keys whose peak never crosses it are omitted, and it defines activePct (default -60)." },
             },
         },
     },
@@ -1369,6 +1400,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Meter snapshot bank ${snap.bank} (${snap.description}, ${snap.elapsedMs}ms, ${snap.floatCount} floats):\n${JSON.stringify(snap)}`,
+                    }],
+                };
+            }
+
+            case "osc_meter_watch": {
+                const { bank, seconds, threshold_db } = (args ?? {}) as { bank?: number; seconds?: number; threshold_db?: number };
+                const w = await osc.meterWatch({ bank: bank ?? 0, seconds: seconds ?? 3, thresholdDb: threshold_db ?? -60 });
+                const flagNote = w.flags.length ? ` — ${w.flags.length} flag(s)` : "";
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Meter watch bank ${w.bank} (${w.description}) over ${w.seconds}s: ${w.frames} frames @ ~${w.sampleRateHz}Hz${flagNote}:\n${JSON.stringify(w)}`,
                     }],
                 };
             }

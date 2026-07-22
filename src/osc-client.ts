@@ -125,13 +125,115 @@ function linToGrDb(v: number): number {
     return 20 * Math.log10(v);
 }
 
+// ---- Shared meter-bank layout descriptors ----
+// One place that maps each blob float index to a named key, so the snapshot decoder
+// and the watch-window statistics agree on key naming and offsets by construction.
+
+const FXRTN_LABELS = ["fxrtn1L", "fxrtn1R", "fxrtn2L", "fxrtn2R", "fxrtn3L", "fxrtn3R", "fxrtn4L", "fxrtn4R"];
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** One named meter, plus the float index it lives at within the blob. */
+type MeterSlot = { key: string; idx: number };
+/** A bank's full float layout: level meters plus optional gate/dyn gain-reduction meters. */
+type MeterLayout = { description: string; level: MeterSlot[]; gateGr?: MeterSlot[]; dynGr?: MeterSlot[] };
+
+/** Per-level-meter statistics over a watch window. */
+export type MeterLevelStat = { peakDb: number; avgDb: number; clipPct: number; activePct: number };
+/** Per-gain-reduction-meter statistics over a watch window. */
+export type MeterGrStat = { maxReductionDb: number; avgReductionDb: number; activePct: number };
+/** A heuristic hint raised by meterWatch — a cue for a human, not a reliable detection. */
+export type MeterWatchFlag = { key: string; flag: "clipping" | "sustained"; detail: string };
+/** Full result of OSCClient.meterWatch. */
+export type MeterWatchResult = {
+    bank: number;
+    description: string;
+    seconds: number;
+    frames: number;
+    sampleRateHz: number;
+    levels: Record<string, MeterLevelStat>;
+    gateGainReduction?: Record<string, MeterGrStat>;
+    dynGainReduction?: Record<string, MeterGrStat>;
+    flags: MeterWatchFlag[];
+};
+
 /**
- * Decode a meter blob into an LLM-friendly named dict per bank layout.
+ * Build the float-index → named-key layout for a meter bank.
  *
  * Bank 0 (70 floats):  ch01..32, auxin1..8, fxrtn1L/1R..4L/4R, bus01..16, mtx01..06
  * Bank 1 (96 floats):  ch01..32 post-fader, ch01..32 gate-GR, ch01..32 dyn-GR
- * Bank 2 (49 floats):  bus01..16, mtx01..06, mainL, mainR, mainM, then GR for the same
- * Bank 3 (22 floats):  auxsnd01..06, auxin1..8, fxrtn1L..4R
+ * Bank 2 (49 floats):  bus01..16, mtx01..06, mainL, mainR, mainM, then dyn-GR for the same (+mainLR/mainM)
+ * Bank 3 (22 floats):  auxsnd1..6, auxin1..8, fxrtn1L..4R
+ */
+function buildMeterLayout(bank: number): MeterLayout {
+    const level: MeterSlot[] = [];
+    if (bank === 0) {
+        let i = 0;
+        for (let c = 0; c < 32; c++) level.push({ key: `ch${pad2(c + 1)}`, idx: i++ });
+        for (let c = 0; c < 8; c++) level.push({ key: `auxin${c + 1}`, idx: i++ });
+        for (let c = 0; c < 8; c++) level.push({ key: FXRTN_LABELS[c], idx: i++ });
+        for (let c = 0; c < 16; c++) level.push({ key: `bus${pad2(c + 1)}`, idx: i++ });
+        for (let c = 0; c < 6; c++) level.push({ key: `mtx${pad2(c + 1)}`, idx: i++ });
+        return { description: "Per-channel post-headamp meters + aux/fx/bus/matrix levels", level };
+    }
+    if (bank === 1) {
+        for (let c = 0; c < 32; c++) level.push({ key: `ch${pad2(c + 1)}`, idx: c });
+        const gateGr: MeterSlot[] = [];
+        const dynGr: MeterSlot[] = [];
+        for (let c = 0; c < 32; c++) gateGr.push({ key: `ch${pad2(c + 1)}`, idx: 32 + c });
+        for (let c = 0; c < 32; c++) dynGr.push({ key: `ch${pad2(c + 1)}`, idx: 64 + c });
+        return { description: "Post-fader channel levels + gate GR + dyn GR (32 channels each)", level, gateGr, dynGr };
+    }
+    if (bank === 2) {
+        let i = 0;
+        for (let c = 0; c < 16; c++) level.push({ key: `bus${pad2(c + 1)}`, idx: i++ });
+        for (let c = 0; c < 6; c++) level.push({ key: `mtx${pad2(c + 1)}`, idx: i++ });
+        level.push({ key: "mainL", idx: i++ });
+        level.push({ key: "mainR", idx: i++ });
+        level.push({ key: "mainM", idx: i++ });
+        const dynGr: MeterSlot[] = [];
+        for (let c = 0; c < 16; c++) dynGr.push({ key: `bus${pad2(c + 1)}`, idx: i++ });
+        for (let c = 0; c < 6; c++) dynGr.push({ key: `mtx${pad2(c + 1)}`, idx: i++ });
+        dynGr.push({ key: "mainLR", idx: i++ });
+        dynGr.push({ key: "mainM", idx: i++ });
+        return { description: "Bus + matrix + main levels with their dyn GR", level, dynGr };
+    }
+    if (bank === 3) {
+        let i = 0;
+        for (let c = 0; c < 6; c++) level.push({ key: `auxsnd${c + 1}`, idx: i++ });
+        for (let c = 0; c < 8; c++) level.push({ key: `auxin${c + 1}`, idx: i++ });
+        for (let c = 0; c < 8; c++) level.push({ key: FXRTN_LABELS[c], idx: i++ });
+        return { description: "Aux sends + aux returns + FX returns", level };
+    }
+    return { description: "", level };
+}
+
+/**
+ * Parse one raw `/meters/N` blob OSC packet into its float array. Returns null if the
+ * packet is not the expected `/meters/N ,b` reply (caller should keep waiting); throws
+ * only on a structurally-broken blob (implausible float count). The X32 packs the blob
+ * as a little-endian int32 float-count followed by that many little-endian float32s.
+ */
+function parseMeterBlobPacket(buf: Buffer, bank: number): number[] | null {
+    const a = readCStringFrom(buf, 0);
+    const t = readCStringFrom(buf, a.next);
+    if (a.s !== `/meters/${bank}` || t.s !== ",b") return null;
+    const blobLen = buf.readInt32BE(t.next);
+    const dataStart = t.next + 4;
+    const numFloats = buf.readInt32LE(dataStart);
+    if (numFloats < 0 || numFloats > 4096) {
+        throw new Error(`Implausible numFloats ${numFloats} from /meters/${bank} (blobLen ${blobLen})`);
+    }
+    const out: number[] = [];
+    for (let i = 0; i < numFloats; i++) {
+        out.push(buf.readFloatLE(dataStart + 4 + i * 4));
+    }
+    return out;
+}
+
+/**
+ * Decode a meter blob into an LLM-friendly named dict per bank layout (see buildMeterLayout).
+ * Level meters below `thresholdDb` and gain-reduction meters not actively reducing (< 0.05 dB)
+ * are omitted to keep the payload compact.
  */
 function decodeMeterBlob(
     bank: number,
@@ -147,118 +249,26 @@ function decodeMeterBlob(
     gateGainReduction?: Record<string, number>;
     dynGainReduction?: Record<string, number>;
 } {
-    const passLevel = (db: number) => Number.isFinite(db) && db >= thresholdDb;
-    const passGr = (db: number) => Number.isFinite(db) && db < -0.05;  // only show GR when actively reducing
+    const layout = buildMeterLayout(bank);
+    const result: any = { bank, description: layout.description, elapsedMs, floatCount: floats.length };
 
-    const result: any = { bank, description: "", elapsedMs, floatCount: floats.length };
-
-    if (bank === 0) {
-        result.description = "Per-channel post-headamp meters + aux/fx/bus/matrix levels";
-        const lv: Record<string, number> = {};
-        for (let i = 0; i < 32; i++) {
-            const db = linToDbfs(floats[i]);
-            if (passLevel(db)) lv[`ch${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
-        }
-        for (let i = 0; i < 8; i++) {
-            const db = linToDbfs(floats[32 + i]);
-            if (passLevel(db)) lv[`auxin${i + 1}`] = +db.toFixed(1);
-        }
-        const fxLabels = ["fxrtn1L", "fxrtn1R", "fxrtn2L", "fxrtn2R", "fxrtn3L", "fxrtn3R", "fxrtn4L", "fxrtn4R"];
-        for (let i = 0; i < 8; i++) {
-            const db = linToDbfs(floats[40 + i]);
-            if (passLevel(db)) lv[fxLabels[i]] = +db.toFixed(1);
-        }
-        for (let i = 0; i < 16; i++) {
-            const db = linToDbfs(floats[48 + i]);
-            if (passLevel(db)) lv[`bus${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
-        }
-        for (let i = 0; i < 6; i++) {
-            const db = linToDbfs(floats[64 + i]);
-            if (passLevel(db)) lv[`mtx${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
-        }
-        result.levels = lv;
-        return result;
+    const lv: Record<string, number> = {};
+    for (const { key, idx } of layout.level) {
+        const db = linToDbfs(floats[idx]);
+        if (Number.isFinite(db) && db >= thresholdDb) lv[key] = +db.toFixed(1);
     }
+    result.levels = lv;
 
-    if (bank === 1) {
-        result.description = "Post-fader channel levels + gate GR + dyn GR (32 channels each)";
-        const lv: Record<string, number> = {};
-        const gateGr: Record<string, number> = {};
-        const dynGr: Record<string, number> = {};
-        for (let i = 0; i < 32; i++) {
-            const db = linToDbfs(floats[i]);
-            if (passLevel(db)) lv[`ch${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
+    const decodeGr = (slots: MeterSlot[]): Record<string, number> => {
+        const out: Record<string, number> = {};
+        for (const { key, idx } of slots) {
+            const grDb = linToGrDb(floats[idx]);
+            if (Number.isFinite(grDb) && grDb < -0.05) out[key] = +grDb.toFixed(1); // only when actively reducing
         }
-        for (let i = 0; i < 32; i++) {
-            const grDb = linToGrDb(floats[32 + i]);
-            if (passGr(grDb)) gateGr[`ch${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
-        }
-        for (let i = 0; i < 32; i++) {
-            const grDb = linToGrDb(floats[64 + i]);
-            if (passGr(grDb)) dynGr[`ch${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
-        }
-        result.levels = lv;
-        result.gateGainReduction = gateGr;
-        result.dynGainReduction = dynGr;
-        return result;
-    }
-
-    if (bank === 2) {
-        result.description = "Bus + matrix + main levels with their dyn GR";
-        const lv: Record<string, number> = {};
-        const dynGr: Record<string, number> = {};
-        for (let i = 0; i < 16; i++) {
-            const db = linToDbfs(floats[i]);
-            if (passLevel(db)) lv[`bus${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
-        }
-        for (let i = 0; i < 6; i++) {
-            const db = linToDbfs(floats[16 + i]);
-            if (passLevel(db)) lv[`mtx${String(i + 1).padStart(2, "0")}`] = +db.toFixed(1);
-        }
-        const mainLeft = linToDbfs(floats[22]);
-        if (passLevel(mainLeft)) lv.mainL = +mainLeft.toFixed(1);
-        const mainRight = linToDbfs(floats[23]);
-        if (passLevel(mainRight)) lv.mainR = +mainRight.toFixed(1);
-        const mainMono = linToDbfs(floats[24]);
-        if (passLevel(mainMono)) lv.mainM = +mainMono.toFixed(1);
-
-        for (let i = 0; i < 16; i++) {
-            const grDb = linToGrDb(floats[25 + i]);
-            if (passGr(grDb)) dynGr[`bus${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
-        }
-        for (let i = 0; i < 6; i++) {
-            const grDb = linToGrDb(floats[41 + i]);
-            if (passGr(grDb)) dynGr[`mtx${String(i + 1).padStart(2, "0")}`] = +grDb.toFixed(1);
-        }
-        const mainLrGr = linToGrDb(floats[47]);
-        if (passGr(mainLrGr)) dynGr.mainLR = +mainLrGr.toFixed(1);
-        const mainMonoGr = linToGrDb(floats[48]);
-        if (passGr(mainMonoGr)) dynGr.mainM = +mainMonoGr.toFixed(1);
-
-        result.levels = lv;
-        result.dynGainReduction = dynGr;
-        return result;
-    }
-
-    if (bank === 3) {
-        result.description = "Aux sends + aux returns + FX returns";
-        const lv: Record<string, number> = {};
-        for (let i = 0; i < 6; i++) {
-            const db = linToDbfs(floats[i]);
-            if (passLevel(db)) lv[`auxsnd${i + 1}`] = +db.toFixed(1);
-        }
-        for (let i = 0; i < 8; i++) {
-            const db = linToDbfs(floats[6 + i]);
-            if (passLevel(db)) lv[`auxin${i + 1}`] = +db.toFixed(1);
-        }
-        const fxLabels = ["fxrtn1L", "fxrtn1R", "fxrtn2L", "fxrtn2R", "fxrtn3L", "fxrtn3R", "fxrtn4L", "fxrtn4R"];
-        for (let i = 0; i < 8; i++) {
-            const db = linToDbfs(floats[14 + i]);
-            if (passLevel(db)) lv[fxLabels[i]] = +db.toFixed(1);
-        }
-        result.levels = lv;
-        return result;
-    }
+        return out;
+    };
+    if (layout.gateGr) result.gateGainReduction = decodeGr(layout.gateGr);
+    if (layout.dynGr) result.dynGainReduction = decodeGr(layout.dynGr);
 
     return result;
 }
@@ -1789,19 +1799,8 @@ export class OSCClient {
             sock.on("message", (buf: Buffer) => {
                 if (settled) return;
                 try {
-                    const a = readCStringFrom(buf, 0);
-                    const t = readCStringFrom(buf, a.next);
-                    if (a.s !== `/meters/${bank}` || t.s !== ",b") return;
-                    const blobLen = buf.readInt32BE(t.next);
-                    const dataStart = t.next + 4;
-                    const numFloats = buf.readInt32LE(dataStart);
-                    if (numFloats < 0 || numFloats > 4096) {
-                        throw new Error(`Implausible numFloats ${numFloats} from /meters/${bank} (blobLen ${blobLen})`);
-                    }
-                    const out: number[] = [];
-                    for (let i = 0; i < numFloats; i++) {
-                        out.push(buf.readFloatLE(dataStart + 4 + i * 4));
-                    }
+                    const out = parseMeterBlobPacket(buf, bank);
+                    if (out === null) return; // not a /meters/N blob — keep waiting
                     settled = true;
                     clearTimeout(timer);
                     cleanup();
@@ -1835,6 +1834,185 @@ export class OSCClient {
                 }
             });
         });
+    }
+
+    /**
+     * Watch a meter bank over a time window and return per-key statistics.
+     *
+     * Opens a dedicated UDP socket, sends the `/meters` subscription request, and collects
+     * EVERY blob frame that arrives for the window (the console streams a fresh blob ~every
+     * 50ms). The request is re-sent every ~2s as renewal insurance (one subscription lasts
+     * ~10s, so a >10s window would otherwise dry up). Every frame is a sample; there is no
+     * dedupe. `seconds` is clamped to [0.5, 10].
+     *
+     * For each level meter: peakDb (max), avgDb (arithmetic mean of per-frame dBFS, floored at
+     * -90 dB for silent frames — averaging in the dB domain rather than power slightly overstates
+     * dips but is fine for "how hot was it"), clipPct (% of frames above -0.5 dBFS), and activePct
+     * (% of frames at/above thresholdDb). Keys whose peak never crossed thresholdDb are omitted.
+     *
+     * For gain-reduction meters (banks 1/2): maxReductionDb, avgReductionDb, and activePct (% of
+     * frames with >0.05 dB reduction). Keys that never reduced by >0.05 dB are omitted.
+     *
+     * `flags` is a heuristic hint list (NOT reliable detection): a "clipping" entry for any key
+     * clipping in >1% of frames, and a "sustained" entry for any key that stayed within a 3 dB
+     * band just below its peak for >90% of frames while peaking above -30 dBFS — a cheap
+     * feedback / stuck-signal cue worth a human's attention, nothing more.
+     */
+    async meterWatch(opts?: { bank?: number; seconds?: number; thresholdDb?: number }): Promise<MeterWatchResult> {
+        const bank = opts?.bank ?? 0;
+        const thresholdDb = opts?.thresholdDb ?? -60;
+        if (![0, 1, 2, 3].includes(bank)) {
+            throw new Error(`Meter bank ${bank} not implemented (valid: 0, 1, 2, 3). Banks 4..15 are RTA/specialty/console-VU and intentionally skipped.`);
+        }
+        const seconds = Math.min(10, Math.max(0.5, opts?.seconds ?? 3));
+        const windowMs = Math.round(seconds * 1000);
+
+        const frames: number[][] = [];
+        const t0 = Date.now();
+        await new Promise<void>((resolve, reject) => {
+            const sock = dgram.createSocket("udp4");
+            let done = false;
+            let renewTimer: NodeJS.Timeout | null = null;
+            let endTimer: NodeJS.Timeout | null = null;
+            const cleanup = () => {
+                if (renewTimer) clearInterval(renewTimer);
+                if (endTimer) clearTimeout(endTimer);
+                try { sock.close(); } catch {}
+            };
+            const finish = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                resolve();
+            };
+            sock.on("message", (buf: Buffer) => {
+                if (done) return;
+                try {
+                    const f = parseMeterBlobPacket(buf, bank);
+                    if (f) frames.push(f);
+                } catch {
+                    // one malformed frame shouldn't abort the window — skip it and keep sampling
+                }
+            });
+            sock.on("error", (e) => {
+                if (done) return;
+                done = true;
+                cleanup();
+                reject(e);
+            });
+            sock.bind(0, "0.0.0.0", () => {
+                const send = () => {
+                    try { sock.send(buildMetersRequest(bank), this.port, this.host); } catch {}
+                };
+                send();                                   // initial subscribe
+                renewTimer = setInterval(send, 2000);     // renewal insurance for long windows
+                endTimer = setTimeout(finish, windowMs);
+            });
+        });
+        const elapsedMs = Date.now() - t0;
+        return this._computeMeterWatchStats(bank, frames, thresholdDb, seconds, elapsedMs);
+    }
+
+    /** Reduce a batch of collected meter frames to per-key statistics + heuristic flags. */
+    private _computeMeterWatchStats(
+        bank: number,
+        frames: number[][],
+        thresholdDb: number,
+        seconds: number,
+        elapsedMs: number,
+    ): MeterWatchResult {
+        const layout = buildMeterLayout(bank);
+        const n = frames.length;
+        const CLIP_DB = -0.5;       // "clip-ish": within 0.5 dB of full scale
+        const GR_ACTIVE_DB = 0.05;  // minimum reduction that counts as "compressor working"
+        const SUSTAIN_DB = -30;     // sustained hint only considers reasonably-loud signals
+        const SUSTAIN_BAND = 3;     // dB band width for the sustained hint
+        const DB_FLOOR = -90;       // silent frames contribute this to the dB-domain average
+        const round1 = (x: number) => (Number.isFinite(x) ? +x.toFixed(1) : x);
+        const pct = (count: number) => (n ? round1((count / n) * 100) : 0);
+
+        const levels: Record<string, MeterLevelStat> = {};
+        const flags: MeterWatchFlag[] = [];
+
+        for (const { key, idx } of layout.level) {
+            let peak = -Infinity;
+            let sum = 0;
+            let clip = 0;
+            let active = 0;
+            let inBand = 0;
+            // Two passes would need the peak first; collect dBs once, then band-count.
+            const dbs: number[] = new Array(n);
+            for (let i = 0; i < n; i++) {
+                const db = linToDbfs(frames[i][idx]);
+                dbs[i] = db;
+                if (db > peak) peak = db;
+                sum += Math.max(db, DB_FLOOR);
+                if (db >= CLIP_DB) clip++;
+                if (Number.isFinite(db) && db >= thresholdDb) active++;
+            }
+            // Filter: omit keys whose peak never crossed the threshold — keeps payload compact.
+            if (!(Number.isFinite(peak) && peak >= thresholdDb)) continue;
+
+            for (let i = 0; i < n; i++) {
+                if (Number.isFinite(dbs[i]) && dbs[i] >= peak - SUSTAIN_BAND) inBand++;
+            }
+            const clipPct = pct(clip);
+            levels[key] = {
+                peakDb: round1(peak),
+                avgDb: round1(n ? sum / n : -Infinity),
+                clipPct,
+                activePct: pct(active),
+            };
+
+            if (clipPct > 1) {
+                flags.push({ key, flag: "clipping", detail: `above ${CLIP_DB} dBFS in ${clipPct}% of ${n} frames — reduce input gain or fader` });
+            }
+            if (peak > SUSTAIN_DB) {
+                const bandPct = pct(inBand);
+                if (bandPct > 90) {
+                    flags.push({ key, flag: "sustained", detail: `held within ${SUSTAIN_BAND} dB of ${round1(peak)} dBFS for ${bandPct}% of ${n} frames — possible feedback or stuck signal (heuristic hint, not detection)` });
+                }
+            }
+        }
+
+        const grStats = (slots: MeterSlot[]): Record<string, MeterGrStat> => {
+            const out: Record<string, MeterGrStat> = {};
+            for (const { key, idx } of slots) {
+                let maxR = 0;
+                let sumR = 0;
+                let active = 0;
+                for (let i = 0; i < n; i++) {
+                    const grDb = linToGrDb(frames[i][idx]);
+                    const red = Number.isFinite(grDb) ? Math.max(0, -grDb) : 0; // reduction as a positive magnitude
+                    if (red > maxR) maxR = red;
+                    sumR += red;
+                    if (red > GR_ACTIVE_DB) active++;
+                }
+                if (maxR <= GR_ACTIVE_DB) continue; // omit meters that never meaningfully reduced
+                out[key] = { maxReductionDb: round1(maxR), avgReductionDb: round1(n ? sumR / n : 0), activePct: pct(active) };
+            }
+            return out;
+        };
+
+        const sampleRateHz = elapsedMs > 0 ? Math.round(n / (elapsedMs / 1000)) : 0;
+        const result: MeterWatchResult = {
+            bank,
+            description: layout.description,
+            seconds,
+            frames: n,
+            sampleRateHz,
+            levels,
+            flags,
+        };
+        if (layout.gateGr) {
+            const g = grStats(layout.gateGr);
+            if (Object.keys(g).length) result.gateGainReduction = g;
+        }
+        if (layout.dynGr) {
+            const d = grStats(layout.dynGr);
+            if (Object.keys(d).length) result.dynGainReduction = d;
+        }
+        return result;
     }
 
     // ========== Insert-effect surface (Phase D″) ==========

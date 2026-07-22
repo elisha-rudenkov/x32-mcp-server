@@ -113,6 +113,13 @@ function tokenizeWriteValues(rest) {
     return out;
 }
 
+// Float count per implemented meter bank (must match src/osc-client.ts buildMeterLayout).
+const METER_FLOAT_COUNTS = { 0: 70, 1: 96, 2: 49, 3: 22 };
+// A meter subscription lasts this long on the real console before it must be renewed.
+const METER_SUBSCRIPTION_MS = 10_000;
+// The console streams a fresh blob about every 50ms.
+const METER_INTERVAL_MS = 50;
+
 export class FakeX32 {
     constructor() {
         this.sock = null;
@@ -125,6 +132,20 @@ export class FakeX32 {
         this.subscribers = new Map();
         this.xinfo = ["127.0.0.1", "FakeX32", "X32EMU", "4.0-fake"];
         this.status = ["active", "127.0.0.1", "FakeX32"];
+        // Active meter streams keyed by "addr:port:bank": { timer, expires, frame }.
+        this.meterStreams = new Map();
+        // Optional per-bank scripting hook: bank -> function(frameIndex, floatCount) -> Float array (linear).
+        // If unset, all floats are ~silence (noise floor).
+        this.meterScripts = new Map();
+    }
+
+    /**
+     * Script the linear float values a meter bank streams over time. `fn(frameIndex, floatCount)`
+     * returns a full linear-value array (length floatCount) for each blob. Level meters are linear
+     * amplitude (1.0 = 0 dBFS); gain-reduction meters are linear (1.0 = no reduction, 0.5 = -6 dB).
+     */
+    setMeterScript(bank, fn) {
+        this.meterScripts.set(Number(bank), fn);
     }
 
     /** Bind the responder. Pass a port or 0 to let the OS choose; resolves with the port. */
@@ -141,6 +162,8 @@ export class FakeX32 {
     }
 
     close() {
+        for (const s of this.meterStreams.values()) clearInterval(s.timer);
+        this.meterStreams.clear();
         if (this.sock) {
             try {
                 this.sock.close();
@@ -149,6 +172,63 @@ export class FakeX32 {
             }
             this.sock = null;
         }
+    }
+
+    /** Build one `/meters/N` blob OSC message from a linear float array (X32 wire format:
+     *  int32BE blob byte-length, then int32LE float count, then little-endian float32s). */
+    _encodeMeterBlob(bank, floats) {
+        const nf = floats.length;
+        const blob = Buffer.alloc(4 + nf * 4); // int32LE count + floats
+        blob.writeInt32LE(nf, 0);
+        for (let i = 0; i < nf; i++) blob.writeFloatLE(floats[i], 4 + i * 4);
+        const lenPrefix = Buffer.alloc(4);
+        lenPrefix.writeInt32BE(blob.length, 0);
+        const padded = Buffer.alloc(padTo4(blob.length));
+        blob.copy(padded);
+        return Buffer.concat([encodeString(`/meters/${bank}`), encodeString(",b"), lenPrefix, padded]);
+    }
+
+    /** Compute the linear float array for one blob frame of a bank, using the scripted hook
+     *  if present, otherwise a flat noise floor (~-100 dBFS). */
+    _meterFrame(bank, frameIndex) {
+        const nf = METER_FLOAT_COUNTS[bank];
+        const fn = this.meterScripts.get(bank);
+        if (fn) {
+            const arr = fn(frameIndex, nf);
+            if (!Array.isArray(arr) || arr.length !== nf) {
+                throw new Error(`fake-x32: meter script for bank ${bank} returned ${Array.isArray(arr) ? arr.length : typeof arr} floats, expected ${nf}`);
+            }
+            return arr;
+        }
+        return new Array(nf).fill(1e-5); // ~-100 dBFS noise floor
+    }
+
+    /** Start (or renew) a meter stream to `rinfo` for `bank`: emits a blob every ~50ms until the
+     *  subscription window elapses, mirroring the real console's push-until-renewed behavior. */
+    _startMeterStream(rinfo, bank) {
+        if (METER_FLOAT_COUNTS[bank] === undefined) return; // unimplemented bank — ignore like the console
+        const key = `${rinfo.address}:${rinfo.port}:${bank}`;
+        const existing = this.meterStreams.get(key);
+        if (existing) {
+            // Renewal: extend the window, keep the same timer / frame counter.
+            existing.expires = Date.now() + METER_SUBSCRIPTION_MS;
+            return;
+        }
+        const stream = { frame: 0, expires: Date.now() + METER_SUBSCRIPTION_MS, timer: null };
+        stream.timer = setInterval(() => {
+            if (!this.sock || Date.now() > stream.expires) {
+                clearInterval(stream.timer);
+                this.meterStreams.delete(key);
+                return;
+            }
+            try {
+                const floats = this._meterFrame(bank, stream.frame++);
+                this.sock.send(this._encodeMeterBlob(bank, floats), rinfo.port, rinfo.address);
+            } catch {
+                // drop a frame on error rather than crashing the responder
+            }
+        }, METER_INTERVAL_MS);
+        this.meterStreams.set(key, stream);
     }
 
     /** Seed / replace the value tokens returned for a /node container. */
@@ -225,6 +305,15 @@ export class FakeX32 {
         if (address === "/xremote") {
             const key = `${rinfo.address}:${rinfo.port}`;
             this.subscribers.set(key, { address: rinfo.address, port: rinfo.port });
+            return;
+        }
+
+        // Meter subscription request: "/meters" ,s "/meters/N". Stream blobs to the sender until
+        // the window elapses; a repeat request renews it. (The real console behaves identically.)
+        if (address === "/meters") {
+            const tag = String(args[0] ?? "");
+            const m = tag.match(/\/meters\/(\d+)/);
+            if (m) this._startMeterStream(rinfo, Number(m[1]));
             return;
         }
 

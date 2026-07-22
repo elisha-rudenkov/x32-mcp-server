@@ -78,7 +78,7 @@ Example prompts that work out of the box:
 
 ## Capability highlights
 
-43 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
+44 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
 
 - **`osc_capabilities`** — single-call structured reference for the LLM. Anti-misconception oriented.
 - **Schema-driven reads/writes** — `osc_node_get` / `osc_node_set` / `osc_list_nodes` cover ~80 parameters per channel without per-feature tool sprawl. Atomic multi-field writes preserve untouched fields.
@@ -87,7 +87,7 @@ Example prompts that work out of the box:
 - **Signal flow** — `osc_trace_signal({channel: N})` walks input → headamp → strip → DCA/mute groups → bus sends → physical outputs. `osc_find_routing({dest})` reverse-looks up what feeds a destination.
 - **FX algorithm parameter surface** — all 61 X32 FX algorithms with named parameters. `osc_fx_get`, `osc_fx_set` (atomic native-unit writes), `osc_fx_set_type` (slot-class-aware). Slot-agnostic — never assumes which rack hosts which algorithm.
 - **Insert FX (GEQ/TEQ on bus/main/mtx)** — `osc_insert_eq_get/set/reset({target})` resolves `target` like `"bus 3"` / `"main"` / `"mtx 1"` to its `insert.sel`, finds the FX rack, and operates on bands by ISO frequency label (`"20Hz"`...`"20kHz"`). Dual algos return `channelA`/`channelB`.
-- **One-shot meter snapshot** — `osc_meter_snapshot({bank})` decodes the X32's binary meter blob into a named dB dict in ~50ms. Banks 0/1/2/3 (per-channel input, post-fader + GR, bus/matrix/main + GR, aux/fx).
+- **Metering — snapshot + windowed watch** — `osc_meter_snapshot({bank})` decodes the X32's binary meter blob into a named dB dict in ~50ms (banks 0/1/2/3: per-channel input, post-fader + GR, bus/matrix/main + GR, aux/fx). `osc_meter_watch({bank, seconds})` blocks for a window (0.5-10s), samples ~20x/sec, and returns per-key peak/avg/clip/active stats + gate/dyn gain-reduction stats + heuristic clipping/sustained flags — for "is it clipping / how hot over time".
 - **Comparisons + copy** — `osc_compare_channels({a, b})` returns only fields that differ. `osc_compare_scenes` diffs two snapshots. `osc_copy_channel({from, to})` schema-driven copy that preserves destination's identity by default.
 - **Per-slot 1:1 user routing** — firmware 4.0+. `osc_get_routing_overview` shows BOTH the legacy 8-channel-block layer AND the 32-slot User In / 48-slot User Out tables decoded to human labels. `osc_set_user_routing_in({slot, source: "Card 1"})` for individual patches.
 - **Typed custom commands** — `osc_custom_command` with explicit `osctype` override (`int`/`float`/`string`/`bool`) for strict addresses where X32 silently drops type-mismatched messages.
@@ -120,7 +120,7 @@ See `SPEC_COVERAGE.md` for the full catalog. Roughly:
 | Scene audit (Phase C) | 2 | `osc_scene_snapshot`, `osc_scene_audit` |
 | FX algorithm surface (Phase D′) | 4 | `osc_fx_get/set/set_type/list_algorithms` |
 | Insert-effect (Phase D″) | 5 | `osc_find_geq_slots`, `osc_get_insert_state`, `osc_insert_eq_*` |
-| Meter snapshot (Phase E) | 1 | `osc_meter_snapshot` |
+| Metering (Phase E) | 2 | `osc_meter_snapshot` (one frame), `osc_meter_watch` (windowed stats) |
 | Comparison + copy (Phase F) | 3 | `osc_compare_channels/scenes`, `osc_copy_channel` |
 | Routing | 4 | `osc_get_routing_overview` (recommended), `osc_list_routing_sources`, `osc_set_user_routing_in/out` |
 | Composite strip reads | 1 | `osc_get_strip` (one tool for ch/bus/auxin/fxrtn/mtx/dca/main/mono) |
