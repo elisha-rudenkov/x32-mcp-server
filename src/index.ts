@@ -95,6 +95,15 @@ setters for every parameter.
 \`osc_meter_snapshot({bank})\` returns dB values for all channels in ~50ms. Banks 0/1/2/3
 implemented. Pair with \`osc_trace_signal\` to debug "no signal at ch N".
 
+### Live state mirror — reads are cache-accelerated with live invalidation
+After connecting, the server keeps a \`/xremote\` subscription alive, so the console pushes
+every parameter change (made at the desk or by another client). Container reads
+(\`osc_node_get\`, \`osc_get_strip\`, \`osc_scene_snapshot\`, overviews, compares, audits) are
+served from an in-memory cache that is invalidated the instant an affected value changes —
+whether that change came from us or from the outside — so cached reads are never stale.
+\`osc_changes\` reports what changed on the console: e.g. "what did the band touch since
+soundcheck?". Cache hit/miss/invalidation counters ride along on \`osc_get_connection\`.
+
 ### Comprehensive scene audit
 \`osc_scene_snapshot\` walks every /node container in ~1.7s. \`osc_scene_audit\` runs
 ~15 deterministic heuristics (feedback risk, gate threshold issues, send-to-muted-bus,
@@ -129,6 +138,11 @@ group memberships by default. Override with \`includeConfig\`/\`includeGroups\` 
 ### "Audit my scene"
 1. \`osc_scene_snapshot()\` — one-shot snapshot (~1.7s, ~700 fields)
 2. \`osc_scene_audit({snapshot})\` — sorted findings (error/warn/info)
+
+### "What did the band change since soundcheck?"
+\`osc_changes({sinceSeconds: 1800})\` — deduped list of every console-side parameter edit
+in the last 30 min (one row per address: latest value + how many times it moved). Pass
+\`includeServer: true\` to also see writes this server made.
 
 ### "Set channel 27 to Card input 1"
 1. \`osc_get_routing_overview()\` — confirm whether the routing block for ch25-32 is set to "User In"
@@ -190,9 +204,10 @@ Use \`osc_list_nodes("ch/*/mix")\` etc. to discover exact field names for any co
 
 ## Tool surface
 
-39 MCP tools:
+40 MCP tools:
 - **\`osc_capabilities\`** — this doc; **\`osc_identity\`** — model + firmware + IP + name
-- **Discovery / connection (3)**: \`osc_discover_mixers\`, \`osc_connect\`, \`osc_get_connection\`
+- **Discovery / connection (3)**: \`osc_discover_mixers\`, \`osc_connect\`, \`osc_get_connection\` (also reports cache stats)
+- **Live state (1)**: \`osc_changes\` — deduped feed of console-side parameter changes
 - **Schema-driven read/write (3)**: \`osc_list_nodes\`, \`osc_node_get\`, \`osc_node_set\` (the canonical way to read/write any parameter)
 - **Composite reads (2)**: \`osc_get_strip({type, number?})\` (one tool for ch/bus/auxin/fxrtn/mtx/dca/main/mono strips), \`osc_get_console_overview\`
 - **Scene snapshot / audit (2)**: \`osc_scene_snapshot\` (optional \`sections\` filter), \`osc_scene_audit\`
@@ -358,8 +373,20 @@ const TOOLS: Tool[] = [
     {
         name: "osc_get_connection",
         description:
-            "Return the current OSC target (host, port, whether sockets are bound). Doesn't probe the mixer — use osc_identity to confirm reachability.",
+            "Return the current OSC target (host, port, whether sockets are bound) plus live-mirror cache stats (entries, hits, misses, invalidations). Doesn't probe the mixer — use osc_identity to confirm reachability.",
         inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "osc_changes",
+        description:
+            "What changed on the console. Returns a deduped feed of parameter changes pushed by the mixer via /xremote (edits made at the desk or by other clients), one row per address with the latest value, a move count, and first/last seconds-ago. Answers 'what did the band touch since soundcheck?'.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                sinceSeconds: { type: "number", description: "Look-back window in seconds (default 300)." },
+                includeServer: { type: "boolean", description: "Also include writes made by this server (source 'server'); default false shows only console-side changes." },
+            },
+        },
     },
     {
         name: "osc_custom_command",
@@ -849,6 +876,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const info = osc.getConnectionInfo();
                 return {
                     content: [{ type: "text", text: `Current OSC target:\n${JSON.stringify(info)}` }],
+                };
+            }
+
+            case "osc_changes": {
+                const { sinceSeconds, includeServer } = (args ?? {}) as {
+                    sinceSeconds?: number;
+                    includeServer?: boolean;
+                };
+                const result = osc.getChanges({ sinceSeconds, includeServer });
+                return {
+                    content: [{ type: "text", text: JSON.stringify(result) }],
                 };
             }
 

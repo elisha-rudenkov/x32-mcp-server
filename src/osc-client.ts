@@ -480,6 +480,32 @@ export function decodeOutputTapSource(n: number): string {
 
 type RawReply = { address: string; args: any[]; raw: string };
 
+/** One cached /node container read. Values are display-unit tokens as returned by the X32. */
+type CacheEntry = { path: string; raw: string; values: string[]; ts: number };
+
+/** One entry in the change feed ring buffer. */
+type ChangeEvent = { ts: number; address: string; value: any; source: ChangeSource };
+type ChangeSource = "console" | "server";
+
+/** A deduped change row returned by getChanges() / the osc_changes tool. */
+export type ChangeRow = {
+    address: string;
+    value: any;
+    source: ChangeSource;
+    count: number;
+    firstSecondsAgo: number;
+    lastSecondsAgo: number;
+};
+
+export type CacheStats = {
+    entries: number;
+    hits: number;
+    misses: number;
+    invalidations: number;
+    ttlMs: number;
+    serving: boolean;
+};
+
 export type DiscoveredMixer = {
     ip: string;
     name: string;
@@ -579,6 +605,23 @@ export class OSCClient {
     private negativeCache: Set<string> = new Set();
     private heartbeatTimer: NodeJS.Timeout | null = null;
 
+    // ---------- Live state mirror: container read cache ----------
+    // Caches nodeRead() container results keyed by normalized node path ("ch/01/mix").
+    // Transparently accelerates every composite tool. Entries are invalidated — never
+    // patched — on any write or pushed change, because pushes carry RAW normalized floats
+    // while the cache holds display-unit tokens; converting between them is a footgun.
+    private nodeCache: Map<string, CacheEntry> = new Map();
+    private static readonly CACHE_TTL_MS = 60_000;
+    private cacheStats = { hits: 0, misses: 0, invalidations: 0 };
+    // OSC_NO_CACHE=1 disables *serving* from cache (still fills it and records changes).
+    private readonly cacheServe: boolean = process.env.OSC_NO_CACHE !== "1";
+
+    // ---------- Live state mirror: change feed ----------
+    // Ring buffer of parameter changes. "console" = arrived unsolicited via the /xremote
+    // push stream (physical console or another client); "server" = caused by our own write.
+    private changeBuffer: ChangeEvent[] = [];
+    private static readonly CHANGE_BUFFER_CAP = 500;
+
     constructor(host: string, port: number) {
         this.host = host;
         this.port = port;
@@ -601,7 +644,12 @@ export class OSCClient {
                 clearTimeout(waiter.timer);
                 if (queue.length === 0) this.responseCallbacks.delete(address);
                 waiter.resolve(message.args[0]);
+                return;
             }
+            // No pending read matched this address — it is an unsolicited push from the
+            // /xremote stream (a change made at the console or by another client). Feed it
+            // to the change log and invalidate the enclosing container's cache entry.
+            this._handleUnsolicited(address, message.args);
         });
         this.osc.on("error", (err: Error) => {
             console.error("OSC Error:", err);
@@ -640,6 +688,9 @@ export class OSCClient {
         this.responseCallbacks.clear();
         // Negative cache is per-mixer — a slot absent on one console may exist on another.
         this.negativeCache.clear();
+        // Read cache + change feed are per-mixer state; drop them on retarget.
+        this._invalidateAll();
+        this.changeBuffer.length = 0;
         this.isConnected = false;
 
         this.host = host;
@@ -655,9 +706,143 @@ export class OSCClient {
         console.error(`OSC client retargeted to ${this.host}:${this.port}`);
     }
 
-    /** Current connection target. Doesn't probe — pair with osc_identity to verify reachability. */
-    getConnectionInfo(): { host: string; port: number; connected: boolean } {
-        return { host: this.host, port: this.port, connected: this.isConnected };
+    /** Current connection target plus live-mirror cache stats. Doesn't probe — pair with
+     *  osc_identity to verify reachability. */
+    getConnectionInfo(): { host: string; port: number; connected: boolean; cache: CacheStats } {
+        return { host: this.host, port: this.port, connected: this.isConnected, cache: this.getCacheStats() };
+    }
+
+    // ========== Live state mirror: cache, change feed, invalidation ==========
+
+    /** Snapshot of container-read cache counters for osc_get_connection. */
+    getCacheStats(): CacheStats {
+        return {
+            entries: this.nodeCache.size,
+            hits: this.cacheStats.hits,
+            misses: this.cacheStats.misses,
+            invalidations: this.cacheStats.invalidations,
+            ttlMs: OSCClient.CACHE_TTL_MS,
+            serving: this.cacheServe,
+        };
+    }
+
+    /** Normalize an OSC path to a cache/lineage key: no leading or trailing slashes. */
+    private _normPath(path: string): string {
+        return path.replace(/^\/+/, "").replace(/\/+$/, "");
+    }
+
+    /** Whether a normalized node path may be cached. Excludes volatile / non-container
+     *  reads (meters, xinfo, status, info) so live data is never served stale. */
+    private _isCacheable(clean: string): boolean {
+        return !/^(meters|xinfo|status|info)(\/|$)/.test(clean);
+    }
+
+    /** Invalidate every cache entry on the same path lineage as `path` — an ancestor
+     *  container, the node itself, or a descendant. Used for both external leaf pushes
+     *  (derive the enclosing container) and our own writes. Correctness-first: it
+     *  over-invalidates along the lineage rather than risk serving a stale container. */
+    private _invalidateLineage(path: string): void {
+        const target = this._normPath(path);
+        if (!target) return;
+        for (const key of this.nodeCache.keys()) {
+            if (key === target || target.startsWith(key + "/") || key.startsWith(target + "/")) {
+                this.nodeCache.delete(key);
+                this.cacheStats.invalidations++;
+            }
+        }
+    }
+
+    /** Drop the entire cache (scene recall / load rewrites the whole console). */
+    private _invalidateAll(): void {
+        this.cacheStats.invalidations += this.nodeCache.size;
+        this.nodeCache.clear();
+    }
+
+    /** Append a change to the ring buffer, trimming to the cap. */
+    private _recordChange(address: string, value: any, source: ChangeSource): void {
+        this.changeBuffer.push({ ts: Date.now(), address, value, source });
+        const overflow = this.changeBuffer.length - OSCClient.CHANGE_BUFFER_CAP;
+        if (overflow > 0) this.changeBuffer.splice(0, overflow);
+    }
+
+    /** An OSC message that matched no pending read: an external parameter change delivered
+     *  via the /xremote push stream. Log it as "console" and invalidate the container. */
+    private _handleUnsolicited(address: string, args: any[] | undefined): void {
+        if (!args || args.length === 0 || !this._isParameterPush(address)) return;
+        this._recordChange(address, args[0], "console");
+        // Pushed values are RAW normalized floats; the cache holds display units. Never
+        // convert — invalidate the enclosing container so the next read fetches fresh.
+        this._invalidateLineage(address);
+    }
+
+    /** Filter /xremote-stream noise: keep real parameter leaves, drop meter blobs, /node
+     *  replies (no leading slash — already excluded), heartbeat echoes, and info replies. */
+    private _isParameterPush(address: string): boolean {
+        if (typeof address !== "string" || address[0] !== "/") return false;
+        if (address === "/xremote") return false;
+        if (/^\/meters(\/|$)/.test(address)) return false;
+        if (/^\/(xinfo|status|info|node)(\/|$)/.test(address)) return false;
+        return true;
+    }
+
+    /** Bookkeeping after one of our own OSC sends that carried a value (a write). Reads and
+     *  the /xremote heartbeat send no args, so they never reach here. */
+    private _afterOwnWrite(address: string, args: any[]): void {
+        if (typeof address !== "string" || address[0] !== "/") return;
+        this._recordChange(address, args[0], "server");
+        if (/^\/-snap\/load(\/|$)/.test(address)) {
+            // Scene recall rewrites the whole console — nuke the entire cache.
+            this._invalidateAll();
+        } else {
+            this._invalidateLineage(address);
+        }
+    }
+
+    /**
+     * Deduped view of the change feed for the osc_changes tool. Groups by address so a
+     * fader wiggle collapses to one row carrying the latest value, a hit count, and
+     * first/last timestamps. Ordered newest-activity-last.
+     *
+     * @param sinceSeconds   only include changes within this window (default 300).
+     * @param includeServer  include our own writes (source "server"); default false so
+     *                       "what did the band change?" shows only console-side edits.
+     */
+    getChanges(opts?: { sinceSeconds?: number; includeServer?: boolean }): {
+        sinceSeconds: number;
+        includeServer: boolean;
+        count: number;
+        changes: ChangeRow[];
+    } {
+        const sinceSeconds = opts?.sinceSeconds ?? 300;
+        const includeServer = opts?.includeServer ?? false;
+        const now = Date.now();
+        const cutoff = now - sinceSeconds * 1000;
+        const grouped = new Map<string, { row: ChangeRow; firstTs: number; lastTs: number }>();
+        for (const ev of this.changeBuffer) {
+            if (ev.ts < cutoff) continue;
+            if (!includeServer && ev.source === "server") continue;
+            const g = grouped.get(ev.address);
+            if (g) {
+                g.row.value = ev.value;
+                g.row.source = ev.source;
+                g.row.count++;
+                g.lastTs = ev.ts;
+            } else {
+                grouped.set(ev.address, {
+                    row: { address: ev.address, value: ev.value, source: ev.source, count: 1, firstSecondsAgo: 0, lastSecondsAgo: 0 },
+                    firstTs: ev.ts,
+                    lastTs: ev.ts,
+                });
+            }
+        }
+        const changes = Array.from(grouped.values())
+            .sort((a, b) => a.lastTs - b.lastTs)
+            .map(({ row, firstTs, lastTs }) => {
+                row.firstSecondsAgo = Math.round((now - firstTs) / 1000);
+                row.lastSecondsAgo = Math.round((now - lastTs) / 1000);
+                return row;
+            });
+        return { sinceSeconds, includeServer, count: changes.length, changes };
     }
 
     /**
@@ -850,6 +1035,15 @@ export class OSCClient {
         if (this._isNegativeCacheable(clean) && this.negativeCache.has(clean)) {
             throw new Error(`Node "${clean}" is negative-cached as absent (timed out after retry). Cleared on reconnect().`);
         }
+        const cacheable = this._isCacheable(clean);
+        if (cacheable && this.cacheServe) {
+            const hit = this.nodeCache.get(clean);
+            if (hit && Date.now() - hit.ts < OSCClient.CACHE_TTL_MS) {
+                this.cacheStats.hits++;
+                // Copy values so callers mutating the array can't corrupt the cache.
+                return { path: hit.path, raw: hit.raw, values: [...hit.values] };
+            }
+        }
         try {
             // Match on address "node" AND the reply payload's path token, so concurrent
             // /node reads (all replying on "node") are disambiguated by their path.
@@ -863,7 +1057,11 @@ export class OSCClient {
             );
             const text = String(reply.args[0] ?? "");
             const parsed = parseNodeLine(text);
-            return { path: parsed.path, raw: text, values: parsed.values };
+            if (cacheable) {
+                this.cacheStats.misses++;
+                this.nodeCache.set(clean, { path: parsed.path, raw: text, values: parsed.values, ts: Date.now() });
+            }
+            return { path: parsed.path, raw: text, values: [...parsed.values] };
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             if (this._isNegativeCacheable(clean) && /^Timeout:/.test(msg)) {
@@ -905,6 +1103,9 @@ export class OSCClient {
         const arg = `${clean} ${encoded}`;
         const buf = this._buildOscMessage("/", arg);
         this.rawSock.send(buf, this.port, this.host);
+        // Our own container write — invalidate the whole subtree and log it as "server".
+        this._invalidateLineage(clean);
+        this._recordChange("/" + clean, encoded, "server");
     }
 
     // ========== Schema-driven node access (Phase D) ==========
@@ -1187,6 +1388,9 @@ export class OSCClient {
         // /node-style writes with the symbolic name, but the leaf int is the
         // documented path for FX type writes.)
         this.sendCommand(`/fx/${slot}/type`, [slotCode]);
+        // Changing the algorithm resets its parameters — invalidate the whole slot subtree
+        // (the leaf write above only clears the /fx/N/type lineage, not fx/N/par).
+        this._invalidateLineage(`fx/${slot}`);
         return {
             slot,
             typeCode: slotCode,
@@ -1999,6 +2203,10 @@ export class OSCClient {
 
         const message = new (OSC as any).Message(address, ...(args || []));
         this.osc.send(message);
+        // A send carrying args is a parameter write; reads and the /xremote heartbeat send
+        // none. Record it and invalidate the affected cache entries. The X32 does not echo
+        // our own writes back, so this is the only place they enter the change feed.
+        if (args && args.length > 0) this._afterOwnWrite(address, args);
     }
 
     private async sendAndReceive(address: string, args?: any[], timeoutMs: number = 300): Promise<any> {
