@@ -4,6 +4,8 @@ import os from "os";
 import {
     NODE_SCHEMA,
     NodeSchemaEntry,
+    FieldDef,
+    FieldType,
     findSchema,
     listSchemas as listSchemasImpl,
     decodeField,
@@ -339,6 +341,25 @@ function encodeWriteValue(v: any): string {
     return s;
 }
 
+/** Numeric field types that support relative {adjust} arithmetic. Enums/strings/bools/bitmasks don't. */
+function isNumericFieldType(t: FieldType): boolean {
+    return t === "int" || t === "float" || t === "db" || t === "freq" || t === "ms" || t === "pct";
+}
+
+/** A relative-adjustment request: `{adjust: N}` in place of an absolute field value. */
+export type AdjustRequest = { adjust: number };
+
+/** Whether a supplied field value is a `{adjust: number}` relative request rather than an absolute. */
+function isAdjustRequest(v: any): v is AdjustRequest {
+    return (
+        v !== null &&
+        typeof v === "object" &&
+        !Array.isArray(v) &&
+        typeof (v as any).adjust === "number" &&
+        Number.isFinite((v as any).adjust)
+    );
+}
+
 /**
  * Coerce a JS value to the correct JS type for osc-js's inference.
  * osc-js picks OSC type tag from JS type: integer number -> 'i', decimal -> 'f', string -> 's', bool -> 'T'/'F'.
@@ -497,6 +518,32 @@ export type ChangeRow = {
     lastSecondsAgo: number;
 };
 
+/** How to reverse one field-level write during undo. */
+type JournalWriteKind = "node" | "fx" | "routeIn" | "routeOut";
+
+/** One captured field-level write inside a journal entry. `prev`/`next` are DECODED values
+ *  (same domain nodeGetField returns); `prev === null` marks a write whose prior state could
+ *  not be captured, so it executed but is not individually revertible. */
+export type JournalWrite = {
+    kind: JournalWriteKind;
+    path: string;      // container path ("ch/01/mix", "fx/3/par") or leaf ("config/userrout/in/27")
+    field: string;     // field / FX-param name, or "source" for routing writes
+    slot?: number;     // FX slot (kind "fx") or routing slot (kind "routeIn"/"routeOut")
+    prev: any;         // decoded prior value, or null if uncapturable
+    next: any;         // decoded new value (informational)
+};
+
+/** One tool call's worth of writes, grouped for single-step undo. */
+export type JournalEntry = {
+    ts: number;
+    label: string;
+    writes: JournalWrite[];
+    revertible: boolean;  // at least one write captured a prior value
+};
+
+/** Compact journal row for the osc_journal tool. */
+export type JournalRow = { ts: number; label: string; writeCount: number; revertible: boolean };
+
 export type CacheStats = {
     entries: number;
     hits: number;
@@ -622,6 +669,17 @@ export class OSCClient {
     private changeBuffer: ChangeEvent[] = [];
     private static readonly CHANGE_BUFFER_CAP = 500;
 
+    // ---------- Undo journal ----------
+    // Every field-level write captures its prior value BEFORE writing and appends a journal
+    // entry. All writes of one tool call fold into ONE entry (grouped via a transaction so a
+    // batch of 12 ops is a single undo step). osc_undo replays the prev values in reverse.
+    private journal: JournalEntry[] = [];
+    private static readonly JOURNAL_CAP = 200;
+    // When non-null, field writes accumulate into this open transaction instead of each
+    // committing its own entry. The method that OPENED the txn is the one that commits it;
+    // nested writers (batch → nodeSetField, insertEqSet → fxSet) just contribute writes.
+    private journalTxn: { label: string; writes: JournalWrite[] } | null = null;
+
     constructor(host: string, port: number) {
         this.host = host;
         this.port = port;
@@ -691,6 +749,9 @@ export class OSCClient {
         // Read cache + change feed are per-mixer state; drop them on retarget.
         this._invalidateAll();
         this.changeBuffer.length = 0;
+        // Journal is per-mixer state; its prev values reference the old console.
+        this.journal.length = 0;
+        this.journalTxn = null;
         this.isConnected = false;
 
         this.host = host;
@@ -843,6 +904,213 @@ export class OSCClient {
                 return row;
             });
         return { sinceSeconds, includeServer, count: changes.length, changes };
+    }
+
+    // ========== Undo journal ==========
+
+    /** Open a journal transaction. Returns true iff THIS caller opened it (and must commit).
+     *  If a txn is already open (nested writer), returns false and writes fold into the outer. */
+    private _beginJournal(label: string): boolean {
+        if (this.journalTxn) return false;
+        this.journalTxn = { label, writes: [] };
+        return true;
+    }
+
+    /** Contribute one captured field write to the open transaction (no-op if none is open). */
+    private _journalWrite(w: JournalWrite): void {
+        if (this.journalTxn) this.journalTxn.writes.push(w);
+    }
+
+    /** Commit the open transaction as a single entry (only the owner may commit). Returns the
+     *  committed entry's index, or -1 if nothing was committed (no writes, or not the owner). */
+    private _commitJournal(owns: boolean): number {
+        if (!owns || !this.journalTxn) return -1;
+        const txn = this.journalTxn;
+        this.journalTxn = null;
+        if (txn.writes.length === 0) return -1;
+        const revertible = txn.writes.some((w) => w.prev !== null && w.prev !== undefined);
+        this.journal.push({ ts: Date.now(), label: txn.label, writes: txn.writes, revertible });
+        const overflow = this.journal.length - OSCClient.JOURNAL_CAP;
+        if (overflow > 0) this.journal.splice(0, overflow);
+        return this.journal.length - 1;
+    }
+
+    /** Push a standalone non-revertible marker entry (e.g. a scene recall boundary). */
+    private _journalMarker(label: string): void {
+        this.journal.push({ ts: Date.now(), label, writes: [], revertible: false });
+        const overflow = this.journal.length - OSCClient.JOURNAL_CAP;
+        if (overflow > 0) this.journal.splice(0, overflow);
+    }
+
+    /**
+     * Resolve a relative {adjust} request against the current decoded value for a numeric field.
+     * Reads the current value from `currentRaw` (the /node token), adds the delta, and clamps to
+     * the field's schema range. A current value of -Infinity dB adjusts up from the range floor
+     * (e.g. -90 dB for faders) rather than staying at -∞. Throws for non-numeric field types.
+     */
+    private _resolveAdjust(field: FieldDef, currentRaw: string | undefined, delta: number): number {
+        if (!isNumericFieldType(field.type)) {
+            throw new Error(
+                `Cannot {adjust} field "${field.name}" (type ${field.type}) — relative adjust only supports numeric fields (int/float/db/freq/ms/pct).`,
+            );
+        }
+        const decoded = currentRaw === undefined ? null : decodeField(field, currentRaw);
+        let base: number;
+        if (decoded === null || decoded === undefined || Number.isNaN(decoded)) {
+            base = field.range ? field.range[0] : 0;
+        } else if (decoded === -Infinity) {
+            if (!field.range) {
+                throw new Error(`Cannot {adjust} "${field.name}" from -∞ without a schema range to floor against.`);
+            }
+            base = field.range[0];
+        } else {
+            base = decoded;
+        }
+        let result = base + delta;
+        if (field.range) {
+            const [min, max] = field.range;
+            if (result < min) result = min;
+            if (result > max) result = max;
+        }
+        return result;
+    }
+
+    /** Compact list of recent journal entries, newest first, for the osc_journal tool. */
+    listJournal(limit: number = 20): { count: number; entries: JournalRow[] } {
+        const n = Math.max(0, Math.min(limit, this.journal.length));
+        const entries: JournalRow[] = [];
+        for (let i = this.journal.length - 1; i >= 0 && entries.length < n; i--) {
+            const e = this.journal[i];
+            entries.push({ ts: e.ts, label: e.label, writeCount: e.writes.length, revertible: e.revertible });
+        }
+        return { count: this.journal.length, entries };
+    }
+
+    /** Replay one journal entry's captured prev values in reverse write order. Assumes a journal
+     *  transaction is already open (the undo entry) so the reverting writes fold into it. */
+    private async _revertEntry(entry: JournalEntry): Promise<number> {
+        let reverted = 0;
+        for (let i = entry.writes.length - 1; i >= 0; i--) {
+            const w = entry.writes[i];
+            if (w.prev === null || w.prev === undefined) continue; // uncapturable — cannot revert
+            switch (w.kind) {
+                case "node":
+                    await this.nodeSetField(w.path, { [w.field]: w.prev });
+                    break;
+                case "fx":
+                    await this.fxSet(w.slot!, { [w.field]: w.prev });
+                    break;
+                case "routeIn":
+                    await this.setUserRoutingIn(w.slot!, w.prev);
+                    break;
+                case "routeOut":
+                    await this.setUserRoutingOut(w.slot!, w.prev);
+                    break;
+            }
+            reverted++;
+        }
+        return reverted;
+    }
+
+    /**
+     * Revert the last `steps` revertible journal entries, newest first, writing each entry's
+     * captured prev values back in reverse order. Non-revertible entries (scene-recall markers,
+     * or writes that couldn't capture prior state) are skipped and reported as warnings. Each
+     * revert is itself journaled as a new entry labeled "undo: <original label>", so undoing an
+     * undo performs a redo.
+     */
+    async undo(steps: number = 1): Promise<{
+        requested: number;
+        reverted: Array<{ label: string; writeCount: number; revertedWrites: number }>;
+        warnings: string[];
+    }> {
+        const want = Math.max(1, Math.floor(steps));
+        // Select targets by snapshotting BEFORE we append any undo entries, so the new entries
+        // we create can't become targets of this same call (that would be a premature redo).
+        const targets: JournalEntry[] = [];
+        const warnings: string[] = [];
+        for (let i = this.journal.length - 1; i >= 0 && targets.length < want; i--) {
+            const e = this.journal[i];
+            if (e.revertible) targets.push(e);
+            else warnings.push(`skipped non-revertible entry "${e.label}"`);
+        }
+        if (targets.length === 0) {
+            warnings.push("nothing revertible to undo");
+            return { requested: want, reverted: [], warnings };
+        }
+        const reverted: Array<{ label: string; writeCount: number; revertedWrites: number }> = [];
+        for (const entry of targets) {
+            const owns = this._beginJournal(`undo: ${entry.label}`);
+            let revertedWrites = 0;
+            try {
+                revertedWrites = await this._revertEntry(entry);
+            } finally {
+                this._commitJournal(owns);
+            }
+            reverted.push({ label: entry.label, writeCount: entry.writes.length, revertedWrites });
+        }
+        return { requested: want, reverted, warnings };
+    }
+
+    /**
+     * Execute a sequence of read/write ops as ONE tool call. Ops run SEQUENTIALLY (so writes
+     * then dependent reads behave predictably) but each op still rides the pooled rawQuery for
+     * wire speed. All writes across the batch fold into a SINGLE undo journal entry.
+     *
+     * Op shapes:
+     *   { get: { path, field? } }        — read a container or single field (decoded)
+     *   { set: { path, fields } }        — absolute and/or {adjust} field writes (atomic per container)
+     *   { fx:  { slot, params } }        — write FX-slot params (delegates to fxSet)
+     *
+     * @param stopOnError  default true: stop at the first failing op and mark the rest skipped.
+     * Returns per-op results in order: { ok, result?, error?, skipped?, undoIndex? }.
+     */
+    async batch(
+        ops: Array<any>,
+        stopOnError: boolean = true,
+    ): Promise<{ count: number; stopOnError: boolean; results: Array<any> }> {
+        if (!Array.isArray(ops)) throw new Error("osc_batch: `ops` must be an array.");
+        if (ops.length === 0) throw new Error("osc_batch: `ops` is empty — nothing to do.");
+        if (ops.length > 50) throw new Error(`osc_batch: at most 50 ops per call (got ${ops.length}).`);
+
+        const owns = this._beginJournal(`batch: ${ops.length} ops`);
+        const results: Array<any> = [];
+        const writeResultIdx: number[] = []; // result indices produced by write ops
+        let stopped = false;
+        try {
+            for (let i = 0; i < ops.length; i++) {
+                if (stopped) {
+                    results.push({ ok: false, skipped: true, error: "skipped: a prior op failed (stopOnError)" });
+                    continue;
+                }
+                const op = ops[i] ?? {};
+                try {
+                    if (op.get) {
+                        const r = await this.nodeGetField(op.get.path, op.get.field);
+                        results.push({ ok: true, result: r });
+                    } else if (op.set) {
+                        const r = await this.nodeSetField(op.set.path, op.set.fields);
+                        results.push({ ok: true, result: { wrote: r.wrote, sent: r.sent } });
+                        writeResultIdx.push(results.length - 1);
+                    } else if (op.fx) {
+                        const r = await this.fxSet(op.fx.slot, op.fx.params);
+                        results.push({ ok: true, result: { wrote: r.wrote, type: r.type } });
+                        writeResultIdx.push(results.length - 1);
+                    } else {
+                        throw new Error(`op ${i}: must contain exactly one of get / set / fx.`);
+                    }
+                } catch (e) {
+                    results.push({ ok: false, error: e instanceof Error ? e.message : String(e) });
+                    if (stopOnError) stopped = true;
+                }
+            }
+        } finally {
+            const undoIndex = this._commitJournal(owns);
+            if (undoIndex >= 0) {
+                for (const ri of writeResultIdx) results[ri].undoIndex = undoIndex;
+            }
+        }
+        return { count: ops.length, stopOnError, results };
     }
 
     /**
@@ -1145,6 +1413,15 @@ export class OSCClient {
      * Reads current values to fill in untouched positions, splices in the named
      * overrides preserving order, encodes per type, and sends one /(X32node) write.
      * Returns the list of fields that were written and the encoded values.
+     *
+     * A field value may be an absolute (e.g. `-6`, `"RD"`, `false`) OR a relative
+     * `{adjust: N}` request: the current decoded value is read (cache-accelerated), the
+     * delta added, and the result clamped to the field's schema range. Adjust is valid
+     * only for numeric field types (int/float/db/freq/ms/pct); it throws for enums/
+     * strings/bools/bitmasks. A -∞ dB current adjusts up from the schema's range floor.
+     *
+     * Every write is captured in the undo journal (grouped into the caller's transaction
+     * if one is open, else its own "node_set <path>" entry).
      */
     async nodeSetField(
         path: string,
@@ -1169,6 +1446,20 @@ export class OSCClient {
         // Untouched leading/middle slots are preserved by reading current state and
         // re-encoding through the schema (so e.g. db tokens like "-oo" round-trip).
         const current = await this.nodeRead(path);
+        const clean = this._normPath(path);
+
+        // Resolve any {adjust} requests to absolute decoded values against current state.
+        // Build a parallel map of the DECODED value we are writing for each field, so the
+        // journal records prev/next in the same domain nodeGetField returns.
+        const resolved: Record<string, any> = {};
+        for (const name of fieldNames) {
+            const f = schema.fields[schema.fields.findIndex((x) => x.name === name)];
+            const raw = fields[name];
+            resolved[name] = isAdjustRequest(raw)
+                ? this._resolveAdjust(f, current.values[schema.fields.indexOf(f)], raw.adjust)
+                : raw;
+        }
+
         let lastIdx = -1;
         for (let i = 0; i < schema.fields.length; i++) {
             if (schema.fields[i].name in fields) lastIdx = i;
@@ -1177,7 +1468,7 @@ export class OSCClient {
         for (let i = 0; i <= lastIdx; i++) {
             const f = schema.fields[i];
             if (f.name in fields) {
-                sent.push(encodeFieldValue(f, fields[f.name]));
+                sent.push(encodeFieldValue(f, resolved[f.name]));
             } else {
                 const raw = current.values[i];
                 // For untouched fields, decode then re-encode so the JS value goes
@@ -1189,7 +1480,20 @@ export class OSCClient {
                 sent.push(encodeFieldValue(f, decodeField(f, raw)));
             }
         }
-        await this.nodeWrite(path, sent);
+
+        // Capture prior state BEFORE writing so the journal can revert us.
+        const owns = this._beginJournal(`node_set /${clean}`);
+        for (const name of fieldNames) {
+            const idx = schema.fields.findIndex((x) => x.name === name);
+            const rawPrev = current.values[idx];
+            const prev = rawPrev === undefined ? null : decodeField(schema.fields[idx], rawPrev);
+            this._journalWrite({ kind: "node", path: clean, field: name, prev, next: resolved[name] });
+        }
+        try {
+            await this.nodeWrite(path, sent);
+        } finally {
+            this._commitJournal(owns);
+        }
         return { wrote: fieldNames, sent };
     }
 
@@ -1349,7 +1653,21 @@ export class OSCClient {
                 sent.push(encodeFieldValue(f, decodeField(f, raw)));
             }
         }
-        await this.nodeWrite(`fx/${slot}/par`, sent);
+
+        // Journal prior param values BEFORE writing (grouped into the caller's txn if open,
+        // e.g. an insert-EQ set or a batch, else its own "fx_set N (<algo>)" entry).
+        const owns = this._beginJournal(`fx_set ${slot} (${algo.name})`);
+        for (const name of paramNames) {
+            const idx = algo.params.findIndex((p) => p.name === name);
+            const rawPrev = current.values[idx];
+            const prev = rawPrev === undefined ? null : decodeField(algo.params[idx], rawPrev);
+            this._journalWrite({ kind: "fx", path: `fx/${slot}/par`, field: name, slot, prev, next: params[name] });
+        }
+        try {
+            await this.nodeWrite(`fx/${slot}/par`, sent);
+        } finally {
+            this._commitJournal(owns);
+        }
         return { wrote: paramNames, sent, type: algo.name };
     }
 
@@ -1755,7 +2073,14 @@ export class OSCClient {
         if (Object.keys(fxParams).length === 0) {
             throw new Error("No bands or master specified — nothing to write.");
         }
-        const result = await this.fxSet(slot, fxParams);
+        // Own the journal txn so the underlying fxSet folds into a single, nicely-labeled entry.
+        const owns = this._beginJournal(`insert_eq_set ${insertState.target}`);
+        let result;
+        try {
+            result = await this.fxSet(slot, fxParams);
+        } finally {
+            this._commitJournal(owns);
+        }
         return { target: insertState.target, slot, type, wrote: result.wrote };
     }
 
@@ -2516,6 +2841,11 @@ export class OSCClient {
     async recallScene(scene: number): Promise<void> {
         const path = `/-snap/load`;
         this.sendCommand(path, [scene - 1]); // Mixer scenes are 0-indexed
+        // A recall rewrites the whole console; prior journal entries reference values that no
+        // longer hold, so reverting across a recall would be wrong. Clear them and drop a
+        // non-revertible boundary marker.
+        this.journal.length = 0;
+        this._journalMarker("scene recall — journal cleared");
     }
 
     async saveScene(scene: number, name?: string): Promise<void> {
@@ -3016,12 +3346,23 @@ export class OSCClient {
     async setUserRoutingIn(slot: number, source: number | string): Promise<void> {
         const code = encodeUserInSource(source);
         const path = `/config/userrout/in/${slot.toString().padStart(2, "0")}`;
+        // Capture prior source code so undo can restore it (null on read failure — write proceeds).
+        const prevRaw = await this.safeRead(path);
+        const prev = typeof prevRaw === "number" ? prevRaw : null;
+        const owns = this._beginJournal(`set_user_routing_in ${slot}`);
+        this._journalWrite({ kind: "routeIn", path: this._normPath(path), field: "source", slot, prev, next: code });
         this.sendCommand(path, [code]);
+        this._commitJournal(owns);
     }
 
     async setUserRoutingOut(slot: number, source: number): Promise<void> {
         const path = `/config/userrout/out/${slot.toString().padStart(2, "0")}`;
+        const prevRaw = await this.safeRead(path);
+        const prev = typeof prevRaw === "number" ? prevRaw : null;
+        const owns = this._beginJournal(`set_user_routing_out ${slot}`);
+        this._journalWrite({ kind: "routeOut", path: this._normPath(path), field: "source", slot, prev, next: source });
         this.sendCommand(path, [source]);
+        this._commitJournal(owns);
     }
 
     // ========== Custom Commands ==========

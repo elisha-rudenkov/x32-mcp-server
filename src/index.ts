@@ -86,6 +86,19 @@ Targets accepted: \`"bus N"\` (1-16), \`"main"\`, \`"main mono"\`, \`"mtx N"\` (
 OSC packet. Untouched fields are preserved. This is the canonical way to write to
 the X32 — bool, dB, freq, enum, bitmask types all coerce automatically.
 
+### Batch operations, relative adjust, and undo (do multi-step work in ONE call)
+Each MCP tool call is a full LLM round trip (seconds); the OSC wire is milliseconds. Collapse
+multi-step mixing into ONE call with \`osc_batch({ ops, stopOnError? })\` (max 50 ops, run in
+order). Ops: \`{get:{path,field?}}\`, \`{set:{path,fields}}\`, \`{fx:{slot,params}}\`. Inside a
+\`set\`, a field value may be a **relative** \`{adjust: N}\` instead of an absolute — the server
+reads the current value, adds the delta, and clamps to the field's schema range (numeric fields
+only; a -∞ dB value adjusts up from the range floor, e.g. -90 dB for faders).
+
+Every write is journaled. All writes of one call fold into a single undo step. \`osc_undo({steps?})\`
+reverts the last N revertible calls (writing prior values back in reverse); undoing an undo is a
+redo. \`osc_journal({limit?})\` lists recent history. A scene recall clears the journal (reverting
+across a full state change would be wrong).
+
 ### Schema engine covers ~6275 leaf fields across 62 containers
 Use \`osc_list_nodes\` to discover what's available for any path pattern. \`osc_node_get\`
 reads typed values; \`osc_node_set\` writes. This replaces hand-wrapping individual
@@ -149,6 +162,20 @@ in the last 30 min (one row per address: latest value + how many times it moved)
 2a. If yes: \`osc_set_user_routing_in({slot: 27, source: "Card 1"})\` — done
 2b. If no: switch the block first (\`osc_custom_command\` to \`/config/routing/IN/25-32\` with int 22 for User In 25-32), then patch the slot
 
+### "Set up monitor bus 3 (build a wedge mix) in one shot"
+One \`osc_batch\` call, one undo step. Sends from ch1-3 to bus 3, nudge one up relatively, unmute the bus:
+\`\`\`
+osc_batch({ ops: [
+  { set: { path: "ch/01/mix/03", fields: { level: -8, on: true } } },
+  { set: { path: "ch/02/mix/03", fields: { level: -10, on: true } } },
+  { set: { path: "ch/03/mix/03", fields: { level: { adjust: 3 } } } },   // vocalist wants "more me"
+  { set: { path: "bus/03/mix", fields: { fader: 0, on: true } } },
+  { get: { path: "bus/03/mix", field: "fader" } }                         // confirm
+]})
+\`\`\`
+Made it too loud? \`osc_undo()\` reverts the whole batch. Use \`osc_list_nodes("ch/*/mix/*")\` to
+confirm the send-level field name for your firmware before relying on it.
+
 ### "Compare ch1 vs ch2"
 \`osc_compare_channels({a: 1, b: 2})\` — returns only the fields that differ.
 
@@ -204,10 +231,11 @@ Use \`osc_list_nodes("ch/*/mix")\` etc. to discover exact field names for any co
 
 ## Tool surface
 
-40 MCP tools:
+43 MCP tools:
 - **\`osc_capabilities\`** — this doc; **\`osc_identity\`** — model + firmware + IP + name
 - **Discovery / connection (3)**: \`osc_discover_mixers\`, \`osc_connect\`, \`osc_get_connection\` (also reports cache stats)
 - **Live state (1)**: \`osc_changes\` — deduped feed of console-side parameter changes
+- **Batch + undo (3)**: \`osc_batch\` (many ops + relative \`{adjust}\` in one call), \`osc_undo\`, \`osc_journal\`
 - **Schema-driven read/write (3)**: \`osc_list_nodes\`, \`osc_node_get\`, \`osc_node_set\` (the canonical way to read/write any parameter)
 - **Composite reads (2)**: \`osc_get_strip({type, number?})\` (one tool for ch/bus/auxin/fxrtn/mtx/dca/main/mono strips), \`osc_get_console_overview\`
 - **Scene snapshot / audit (2)**: \`osc_scene_snapshot\` (optional \`sections\` filter), \`osc_scene_audit\`
@@ -230,6 +258,7 @@ FX read/write via \`osc_fx_get\`/\`osc_fx_set\`.
 - **Never assume routing is 8-channel block only.** Check \`osc_get_routing_overview\`.
 - **Confirm before destructive actions** (mute main, copy over a configured channel, change FX algorithm).
 - **Restore state after probing.** Capture pre-state, modify, restore.
+- **Prefer \`osc_batch\` for multi-step changes** (one round trip, one undo step); \`osc_undo\` reverts mistakes.
 `;
 
 // Define available tools
@@ -666,6 +695,46 @@ const TOOLS: Tool[] = [
             type: "object",
             properties: {
                 snapshot: { type: "object", description: "Optional prior osc_scene_snapshot result.", additionalProperties: true },
+            },
+        },
+    },
+    {
+        name: "osc_batch",
+        description:
+            "Run many read/write ops as ONE call (max 50), sequentially, all writes journaled as a single undo step — the way to do multi-step mixing without a round trip per change. Each op is {get:{path,field?}}, {set:{path,fields}} (fields may be absolutes or {adjust:N} relative deltas, clamped to range), or {fx:{slot,params}}. stopOnError (default true) halts at the first failure and marks the rest skipped. Returns per-op {ok,result?,error?,undoIndex?}.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                ops: {
+                    type: "array",
+                    description: "Ordered ops. Each: {get:{path,field?}} | {set:{path,fields}} | {fx:{slot,params}}. In `set` fields, a value may be a {adjust:N} relative delta (numeric fields only).",
+                    items: { type: "object", additionalProperties: true },
+                    maxItems: 50,
+                },
+                stopOnError: { type: "boolean", description: "Stop at first failing op and skip the rest. Default true.", default: true },
+            },
+            required: ["ops"],
+        },
+    },
+    {
+        name: "osc_undo",
+        description:
+            "Revert the last N revertible tool calls (default 1), writing captured prior values back in reverse order. Non-revertible entries (scene-recall markers, uncaptured writes) are skipped with a warning. Each undo is itself journaled, so undoing an undo is a redo.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                steps: { type: "number", description: "How many revertible journal entries to revert (default 1).", minimum: 1 },
+            },
+        },
+    },
+    {
+        name: "osc_journal",
+        description:
+            "List recent write history (default 20, newest first): each entry's timestamp, label, write count, and whether it is revertible via osc_undo.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "Max entries to return (default 20).", minimum: 1 },
             },
         },
     },
@@ -1399,6 +1468,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Scene audit (${result.findings.length} findings — ${JSON.stringify(counts)}):\n${JSON.stringify(result)}`,
+                    }],
+                };
+            }
+
+            case "osc_batch": {
+                const { ops, stopOnError } = args as { ops: any[]; stopOnError?: boolean };
+                const r = await osc.batch(ops, stopOnError ?? true);
+                const okCount = r.results.filter((x: any) => x.ok).length;
+                const failCount = r.results.filter((x: any) => !x.ok && !x.skipped).length;
+                const skipCount = r.results.filter((x: any) => x.skipped).length;
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Batch of ${r.count} op(s) — ${okCount} ok, ${failCount} failed, ${skipCount} skipped (stopOnError=${r.stopOnError}):\n${JSON.stringify(r.results)}`,
+                    }],
+                };
+            }
+
+            case "osc_undo": {
+                const { steps } = (args ?? {}) as { steps?: number };
+                const r = await osc.undo(steps ?? 1);
+                const totalWrites = r.reverted.reduce((s, e) => s + e.revertedWrites, 0);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Undid ${r.reverted.length} entr(ies), ${totalWrites} write(s) reverted${r.warnings.length ? ` — warnings: ${r.warnings.join("; ")}` : ""}.\n${JSON.stringify(r)}`,
+                    }],
+                };
+            }
+
+            case "osc_journal": {
+                const { limit } = (args ?? {}) as { limit?: number };
+                const r = osc.listJournal(limit ?? 20);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Journal: ${r.entries.length} of ${r.count} entr(ies) shown (newest first):\n${JSON.stringify(r.entries)}`,
                     }],
                 };
             }

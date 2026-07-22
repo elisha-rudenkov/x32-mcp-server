@@ -78,10 +78,11 @@ Example prompts that work out of the box:
 
 ## Capability highlights
 
-39 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
+43 MCP tools. The schema engine covers **62 `/node` containers**, **1738 concrete paths**, and **6275 leaf fields** (full breakdown in `SPEC_COVERAGE.md`). High-leverage features:
 
 - **`osc_capabilities`** — single-call structured reference for the LLM. Anti-misconception oriented.
 - **Schema-driven reads/writes** — `osc_node_get` / `osc_node_set` / `osc_list_nodes` cover ~80 parameters per channel without per-feature tool sprawl. Atomic multi-field writes preserve untouched fields.
+- **Batch + relative adjust + undo** — `osc_batch({ops})` runs up to 50 get/set/fx ops in one call (each write ~1 wire round trip, not one LLM round trip); `set` fields accept relative `{adjust: N}` deltas clamped to schema range. Every call is journaled: `osc_undo` reverts the last N, `osc_journal` lists history.
 - **Scene audit** — `osc_scene_snapshot` (full mixer dump in ~1.7s) + `osc_scene_audit` (~15 deterministic heuristics: feedback risk, gate threshold issues, send-to-muted-bus, FX-configured-but-muted, orphan channels, linked-pair drift, etc.). Sorted error/warn/info.
 - **Signal flow** — `osc_trace_signal({channel: N})` walks input → headamp → strip → DCA/mute groups → bus sends → physical outputs. `osc_find_routing({dest})` reverse-looks up what feeds a destination.
 - **FX algorithm parameter surface** — all 61 X32 FX algorithms with named parameters. `osc_fx_get`, `osc_fx_set` (atomic native-unit writes), `osc_fx_set_type` (slot-class-aware). Slot-agnostic — never assumes which rack hosts which algorithm.
@@ -114,6 +115,7 @@ See `SPEC_COVERAGE.md` for the full catalog. Roughly:
 | Discovery / capabilities | 1 | `osc_capabilities` (CALL FIRST when uncertain) |
 | Identity / status | 2 | `osc_identity`, `osc_get_console_overview` |
 | Schema-driven (Phase D) | 3 | `osc_list_nodes`, `osc_node_get`, `osc_node_set` |
+| Batch + undo | 3 | `osc_batch` (ops + relative `{adjust}`), `osc_undo`, `osc_journal` |
 | Signal-flow diagnostics (Phase B) | 2 | `osc_trace_signal`, `osc_find_routing` |
 | Scene audit (Phase C) | 2 | `osc_scene_snapshot`, `osc_scene_audit` |
 | FX algorithm surface (Phase D′) | 4 | `osc_fx_get/set/set_type/list_algorithms` |

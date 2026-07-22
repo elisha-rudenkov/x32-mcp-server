@@ -88,6 +88,31 @@ function decodeMessage(buf) {
 
 const norm = (p) => String(p).replace(/^\/+/, "").replace(/\/+$/, "");
 
+/** Tokenize the value portion of an X32node write, respecting "quoted" tokens (may contain spaces). */
+function tokenizeWriteValues(rest) {
+    const out = [];
+    let i = 0;
+    while (i < rest.length) {
+        while (i < rest.length && rest[i] === " ") i++;
+        if (i >= rest.length) break;
+        if (rest[i] === '"') {
+            i++;
+            let s = "";
+            while (i < rest.length && rest[i] !== '"') {
+                if (rest[i] === "\\" && i + 1 < rest.length) { s += rest[i + 1]; i += 2; }
+                else { s += rest[i]; i++; }
+            }
+            out.push(s);
+            if (i < rest.length) i++;
+        } else {
+            const start = i;
+            while (i < rest.length && rest[i] !== " ") i++;
+            out.push(rest.slice(start, i));
+        }
+    }
+    return out;
+}
+
 export class FakeX32 {
     constructor() {
         this.sock = null;
@@ -203,14 +228,21 @@ export class FakeX32 {
             return;
         }
 
-        // X32node write: "/" with a single string arg "path val1 val2 ...". Bump the stored
-        // container so a re-read reflects the write (real console applies it immediately).
+        // X32node write: "/" with a single string arg "path val1 val2 ...". Apply it as a
+        // PREFIX-PARTIAL write (like the real console): the incoming tokens overwrite the
+        // leading fields and any untouched trailing fields are preserved, so a subsequent
+        // /node read reflects the merged state.
         if (address === "/") {
             const text = String(args[0] ?? "");
             const sp = text.indexOf(" ");
             const path = norm(sp === -1 ? text : text.slice(0, sp));
             const rest = sp === -1 ? "" : text.slice(sp + 1);
-            if (rest.length) this.nodes.set(path, rest.split(/\s+/));
+            if (rest.length) {
+                const incoming = tokenizeWriteValues(rest);
+                const merged = (this.nodes.get(path) ?? []).slice();
+                for (let i = 0; i < incoming.length; i++) merged[i] = incoming[i];
+                this.nodes.set(path, merged);
+            }
             return;
         }
 
